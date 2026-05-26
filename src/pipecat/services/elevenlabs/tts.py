@@ -588,6 +588,7 @@ class ElevenLabsTTSService(WebsocketTTSService):
         self._voice_settings = self._set_voice_settings()
         self._pronunciation_dictionary_locators = _pronunciation_dictionary_locators
         self._context_init_sent: set[str] = set()
+        self._connection_voice_settings_sent: bool = False
 
         self._cumulative_time = 0
         # Track partial words that span across alignment chunks
@@ -645,25 +646,17 @@ class ElevenLabsTTSService(WebsocketTTSService):
         url_changed = bool(changed.keys() & self.Settings.URL_FIELDS)
         voice_settings_changed = bool(changed.keys() & self.Settings.VOICE_SETTINGS_FIELDS)
 
-        if url_changed:
-            logger.debug(
-                f"URL-level setting changed ({changed.keys() & self.Settings.URL_FIELDS}), "
-                f"reconnecting WebSocket"
+        if url_changed or voice_settings_changed:
+            reason = (
+                f"URL-level setting changed ({changed.keys() & self.Settings.URL_FIELDS})"
+                if url_changed
+                else f"Voice settings changed ({changed.keys() & self.Settings.VOICE_SETTINGS_FIELDS})"
             )
+            logger.debug(f"{reason}, reconnecting WebSocket")
             await self._disconnect()
             await self._connect()
-        elif voice_settings_changed:
-            logger.debug(
-                f"Voice settings changed ({changed.keys() & self.Settings.VOICE_SETTINGS_FIELDS}), "
-                f"closing current context to apply changes"
-            )
-            audio_contexts = self.get_audio_contexts()
-            if audio_contexts:
-                for ctx_id in audio_contexts:
-                    await self._close_context(ctx_id)
-                    self._reset_alignment_state(ctx_id)
 
-        if not url_changed:
+        if not url_changed and not voice_settings_changed:
             # Reconnect applies all settings; only warn about fields not handled
             # by voice settings or URL changes.
             handled = self.Settings.URL_FIELDS | self.Settings.VOICE_SETTINGS_FIELDS
@@ -793,6 +786,7 @@ class ElevenLabsTTSService(WebsocketTTSService):
         finally:
             await self.remove_active_audio_context()
             self._context_init_sent.clear()
+            self._connection_voice_settings_sent = False
             self._websocket = None
             await self._call_event_handler("on_disconnected")
 
@@ -974,10 +968,13 @@ class ElevenLabsTTSService(WebsocketTTSService):
                     self._partial_word = ""
                     self._partial_word_start_time = 0.0
 
-                    # Initialize context with voice settings and pronunciation dictionaries
+                    # Initialize context — voice_settings are per-connection (only
+                    # the first message may include them; ElevenLabs rejects 1008
+                    # if they appear again, even with identical values).
                     msg: dict[str, Any] = {"text": " ", "context_id": context_id}
-                    if self._voice_settings:
+                    if self._voice_settings and not self._connection_voice_settings_sent:
                         msg["voice_settings"] = self._voice_settings
+                        self._connection_voice_settings_sent = True
                     if self._pronunciation_dictionary_locators:
                         msg["pronunciation_dictionary_locators"] = [
                             locator.model_dump()
