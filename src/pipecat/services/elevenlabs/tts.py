@@ -587,6 +587,7 @@ class ElevenLabsTTSService(WebsocketTTSService):
         self._output_format = ""  # initialized in start()
         self._voice_settings = self._set_voice_settings()
         self._pronunciation_dictionary_locators = _pronunciation_dictionary_locators
+        self._context_init_sent: set[str] = set()
 
         self._cumulative_time = 0
         # Track partial words that span across alignment chunks
@@ -791,6 +792,7 @@ class ElevenLabsTTSService(WebsocketTTSService):
             await self.push_error(error_msg=f"Unknown error occurred: {e}", exception=e)
         finally:
             await self.remove_active_audio_context()
+            self._context_init_sent.clear()
             self._websocket = None
             await self._call_event_handler("on_disconnected")
 
@@ -827,11 +829,13 @@ class ElevenLabsTTSService(WebsocketTTSService):
         """Close the ElevenLabs context when the bot is interrupted."""
         await self._close_context(context_id)
         self._reset_alignment_state(context_id)
+        self._context_init_sent.discard(context_id)
         await super().on_audio_context_interrupted(context_id)
 
     async def on_audio_context_completed(self, context_id: str):
         """Reset alignment state after all audio for the context has played."""
         self._reset_alignment_state(context_id)
+        self._context_init_sent.discard(context_id)
         await super().on_audio_context_completed(context_id)
 
     async def on_turn_context_completed(self):
@@ -916,8 +920,7 @@ class ElevenLabsTTSService(WebsocketTTSService):
             try:
                 if self._websocket and self._websocket.state is State.OPEN:
                     context_id = self.get_active_audio_context_id()
-                    if context_id:
-                        # Send keepalive with context ID to keep the connection alive
+                    if context_id and context_id in self._context_init_sent:
                         keepalive_message = {
                             "text": "",
                             "context_id": context_id,
@@ -981,6 +984,7 @@ class ElevenLabsTTSService(WebsocketTTSService):
                             for locator in self._pronunciation_dictionary_locators
                         ]
                     await self._websocket.send(json.dumps(msg))
+                    self._context_init_sent.add(context_id)
                     logger.trace(f"Created new context {context_id}")
 
                 await self._send_text(text, context_id)
