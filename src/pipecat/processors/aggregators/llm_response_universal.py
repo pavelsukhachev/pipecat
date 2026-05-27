@@ -363,6 +363,7 @@ class LLMContextAggregator(FrameProcessor):
         self._add_tool_change_messages = add_tool_change_messages
 
         self._aggregation: list[TextPartForConcatenation] = []
+        self._aggregation_generation: int = 0
 
     def _maybe_add_tool_change_messages(self, new_tools: ToolsSchema | NotGiven) -> None:
         """Append a developer message describing tool add/remove deltas.
@@ -495,6 +496,7 @@ class LLMContextAggregator(FrameProcessor):
     async def reset(self):
         """Reset the aggregation state."""
         self._aggregation = []
+        self._aggregation_generation += 1
 
     @abstractmethod
     async def push_aggregation(self) -> str:
@@ -1083,6 +1085,7 @@ class LLMAssistantAggregator(LLMContextAggregator):
         self._push_context_on_bot_stopped_speaking: bool = False
 
         self._assistant_turn_start_timestamp = ""
+        self._active_llm_generation: int = 0
 
         self._thought_append_to_context = False
         self._thought_llm: str = ""
@@ -1221,7 +1224,14 @@ class LLMAssistantAggregator(LLMContextAggregator):
         if not self._aggregation:
             return ""
 
-        aggregation = self.aggregation_string()
+        # Atomic swap: capture current buffer and immediately replace it
+        # so new TextFrames from a subsequent LLM response go to a fresh
+        # list.  The await in reset() yields the event loop — without
+        # the swap, tokens from a new response can interleave into the
+        # old buffer between the read and the clear.
+        current_aggregation = self._aggregation
+        self._aggregation = []
+        aggregation = concatenate_aggregated_text(current_aggregation)
         await self.reset()
 
         if aggregation:
@@ -1510,6 +1520,7 @@ class LLMAssistantAggregator(LLMContextAggregator):
             )
 
     async def _handle_llm_start(self, _: LLMFullResponseStartFrame):
+        self._active_llm_generation = self._aggregation_generation
         await self._trigger_assistant_turn_started()
 
     async def _handle_llm_end(self, _: LLMFullResponseEndFrame):
@@ -1536,6 +1547,16 @@ class LLMAssistantAggregator(LLMContextAggregator):
 
         # Make sure we really have text (spaces count, too!)
         if len(frame.text) == 0:
+            return
+
+        # Reject stale tokens from a pre-interruption LLM response whose
+        # stream hasn't fully drained yet.  reset() bumps the generation
+        # counter; if the LLM response that started this stream recorded a
+        # different generation, its tokens belong to a cancelled turn.
+        if (
+            hasattr(self, "_active_llm_generation")
+            and self._active_llm_generation != self._aggregation_generation
+        ):
             return
 
         self._aggregation.append(
