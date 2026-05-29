@@ -52,6 +52,7 @@ from pipecat.services.settings import TTSSettings, is_given
 from pipecat.services.websocket_service import WebsocketService
 from pipecat.transcriptions.language import Language
 from pipecat.utils.frame_queue import FrameQueue
+from pipecat.utils.text.base_text_aggregator import BaseTextAggregator
 from pipecat.utils.text.base_text_filter import BaseTextFilter
 from pipecat.utils.text.simple_text_aggregator import SimpleTextAggregator
 from pipecat.utils.time import seconds_to_nanoseconds
@@ -141,6 +142,9 @@ class TTSService(AIService):
         self,
         *,
         text_aggregation_mode: TextAggregationMode | None = None,
+        # Inshurik: optional custom text aggregator. When provided it overrides the
+        # default SimpleTextAggregator — used to inject BufferingSentenceAggregator.
+        text_aggregator: BaseTextAggregator | None = None,
         aggregate_sentences: bool | None = None,
         # if True, TTSService will push TextFrames and LLMFullResponseEndFrames,
         # otherwise subclass must do it
@@ -280,7 +284,9 @@ class TTSService(AIService):
         self._append_trailing_space: bool = append_trailing_space
         self._init_sample_rate = sample_rate
         self._sample_rate = 0
-        self._text_aggregator = SimpleTextAggregator(aggregation_type=self._text_aggregation_mode)
+        self._text_aggregator = text_aggregator or SimpleTextAggregator(
+            aggregation_type=self._text_aggregation_mode
+        )
 
         self._skip_aggregator_types: list[str] = skip_aggregator_types or []
         self._text_transforms: list[
