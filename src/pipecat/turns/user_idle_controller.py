@@ -63,6 +63,7 @@ class UserIdleController(BaseObject):
         self._user_idle_timeout = user_idle_timeout
 
         self._user_turn_in_progress: bool = False
+        self._bot_speaking: bool = False
         self._function_calls_in_progress: int = 0
         self._idle_timer_task: asyncio.Task | None = None
 
@@ -86,6 +87,7 @@ class UserIdleController(BaseObject):
             return
 
         if isinstance(frame, BotStoppedSpeakingFrame):
+            self._bot_speaking = False
             # Only start the timer if the user isn't mid-turn and no function
             # calls are pending.
             #
@@ -103,12 +105,26 @@ class UserIdleController(BaseObject):
             if not self._user_turn_in_progress and self._function_calls_in_progress == 0:
                 await self._start_idle_timer()
         elif isinstance(frame, BotStartedSpeakingFrame):
+            self._bot_speaking = True
             await self._cancel_idle_timer()
         elif isinstance(frame, UserStartedSpeakingFrame):
             self._user_turn_in_progress = True
             await self._cancel_idle_timer()
         elif isinstance(frame, UserStoppedSpeakingFrame):
             self._user_turn_in_progress = False
+            # Restart the idle timer when the user's turn ends and the bot is
+            # not speaking. This covers a *filtered* barge-in: a short utterance
+            # (e.g. "yes"/"okay") spoken during bot TTS that a user-turn-start
+            # strategy suppresses, so it never becomes a real turn and the LLM
+            # never responds. When that barge-in's UserStoppedSpeaking arrives
+            # AFTER BotStoppedSpeaking, the BotStopped guard above saw
+            # _user_turn_in_progress=True and skipped starting the timer; without
+            # this restart the timer never (re)starts and on_user_turn_idle never
+            # fires, leaving the bot silent for minutes until the user speaks
+            # again. Guarded on bot-not-speaking (an in-bot-TTS barge-in is still
+            # handled by the BotStopped branch) and no function call in flight.
+            if not self._bot_speaking and self._function_calls_in_progress == 0:
+                await self._start_idle_timer()
         elif isinstance(frame, FunctionCallsStartedFrame):
             self._function_calls_in_progress += len(frame.function_calls)
             await self._cancel_idle_timer()

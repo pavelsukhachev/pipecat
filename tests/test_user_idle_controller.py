@@ -15,6 +15,7 @@ from pipecat.frames.frames import (
     FunctionCallsStartedFrame,
     UserIdleTimeoutUpdateFrame,
     UserStartedSpeakingFrame,
+    UserStoppedSpeakingFrame,
 )
 from pipecat.turns.user_idle_controller import UserIdleController
 from pipecat.utils.asyncio.task_manager import TaskManager, TaskManagerParams
@@ -130,6 +131,89 @@ class TestUserIdleController(unittest.IsolatedAsyncioTestCase):
         # Wait - timer should NOT have started because user turn is in progress
         await asyncio.sleep(USER_IDLE_TIMEOUT + 0.1)
 
+        self.assertFalse(idle_triggered)
+
+        await controller.cleanup()
+
+    async def test_filtered_bargein_restarts_timer(self):
+        """Filtered barge-in recovery: UserStopped after BotStopped restarts the timer.
+
+        A short utterance spoken during bot TTS (e.g. "yes"/"okay") can be
+        suppressed by a user-turn-start strategy so it never becomes a real turn.
+        Frame order: BotStarted → UserStarted (barge-in) → BotStopped (skipped,
+        user turn "in progress") → UserStopped. Before the fix the timer never
+        (re)started and idle never fired (multi-minute dead air). It must now fire.
+        """
+        controller = UserIdleController(user_idle_timeout=USER_IDLE_TIMEOUT)
+        await controller.setup(self.task_manager)
+
+        idle_triggered = False
+
+        @controller.event_handler("on_user_turn_idle")
+        async def on_user_turn_idle(controller):
+            nonlocal idle_triggered
+            idle_triggered = True
+
+        await controller.process_frame(BotStartedSpeakingFrame())
+        await controller.process_frame(UserStartedSpeakingFrame())
+        await controller.process_frame(BotStoppedSpeakingFrame())
+        await controller.process_frame(UserStoppedSpeakingFrame())
+
+        await asyncio.sleep(USER_IDLE_TIMEOUT + 0.1)
+
+        self.assertTrue(idle_triggered)
+
+        await controller.cleanup()
+
+    async def test_user_stops_while_bot_speaking_no_premature_timer(self):
+        """UserStopped while the bot is still speaking must NOT start the timer.
+
+        The BotStopped branch starts it once the bot actually finishes.
+        """
+        controller = UserIdleController(user_idle_timeout=USER_IDLE_TIMEOUT)
+        await controller.setup(self.task_manager)
+
+        idle_triggered = False
+
+        @controller.event_handler("on_user_turn_idle")
+        async def on_user_turn_idle(controller):
+            nonlocal idle_triggered
+            idle_triggered = True
+
+        await controller.process_frame(BotStartedSpeakingFrame())
+        await controller.process_frame(UserStartedSpeakingFrame())
+        await controller.process_frame(UserStoppedSpeakingFrame())  # bot still speaking
+
+        await asyncio.sleep(USER_IDLE_TIMEOUT + 0.1)
+        self.assertFalse(idle_triggered)
+
+        # Bot finishes — now the timer starts and fires.
+        await controller.process_frame(BotStoppedSpeakingFrame())
+        await asyncio.sleep(USER_IDLE_TIMEOUT + 0.1)
+        self.assertTrue(idle_triggered)
+
+        await controller.cleanup()
+
+    async def test_user_stops_during_function_call_no_timer(self):
+        """UserStopped while a function call is in flight must NOT start the timer."""
+        controller = UserIdleController(user_idle_timeout=USER_IDLE_TIMEOUT)
+        await controller.setup(self.task_manager)
+
+        idle_triggered = False
+
+        @controller.event_handler("on_user_turn_idle")
+        async def on_user_turn_idle(controller):
+            nonlocal idle_triggered
+            idle_triggered = True
+
+        await controller.process_frame(
+            FunctionCallsStartedFrame(function_calls=[unittest.mock.Mock()])
+        )
+        await controller.process_frame(BotStoppedSpeakingFrame())
+        await controller.process_frame(UserStartedSpeakingFrame())
+        await controller.process_frame(UserStoppedSpeakingFrame())
+
+        await asyncio.sleep(USER_IDLE_TIMEOUT + 0.1)
         self.assertFalse(idle_triggered)
 
         await controller.cleanup()
