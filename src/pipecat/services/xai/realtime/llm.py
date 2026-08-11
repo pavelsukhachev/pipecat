@@ -30,6 +30,7 @@ from pipecat.frames.frames import (
     EndFrame,
     Frame,
     InputAudioRawFrame,
+    InterimTranscriptionFrame,
     InterruptionFrame,
     LLMContextFrame,
     LLMFullResponseEndFrame,
@@ -666,6 +667,8 @@ class GrokRealtimeLLMService(LLMService[GrokRealtimeLLMAdapter]):
                 await self._handle_evt_conversation_item_added(evt)
             elif evt.type == "conversation.item.input_audio_transcription.completed":
                 await self._handle_evt_input_audio_transcription_completed(evt)
+            elif evt.type == "conversation.item.input_audio_transcription.updated":
+                await self._handle_evt_input_audio_transcription_updated(evt)
             elif evt.type == "response.done":
                 await self._handle_evt_response_done(evt)
             elif evt.type == "input_audio_buffer.speech_started":
@@ -751,6 +754,15 @@ class GrokRealtimeLLMService(LLMService[GrokRealtimeLLMAdapter]):
         if evt.item.role == "assistant":
             self._current_assistant_response = evt.item
             await self.push_frame(LLMFullResponseStartFrame())
+
+    async def _handle_evt_input_audio_transcription_updated(self, evt):
+        """Handle streaming transcription updates (interim user captions)."""
+        transcript = evt.transcript.strip() if evt.transcript else ""
+        if transcript:
+            await self.push_frame(
+                InterimTranscriptionFrame(transcript, "", time_now_iso8601(), result=evt),
+                FrameDirection.UPSTREAM,
+            )
 
     async def _handle_evt_input_audio_transcription_completed(self, evt):
         """Handle input audio transcription completed event."""

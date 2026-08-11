@@ -488,6 +488,29 @@ class ConversationItemAdded(ServerEvent):
     item: ConversationItem
 
 
+class ConversationItemInputAudioTranscriptionUpdated(ServerEvent):
+    """Streaming update of a user utterance's transcription.
+
+    xAI emits these continuously while the user speaks (observed live
+    2026-08-10; payload: item_id, running transcript, content_index,
+    previous_item_id). A final ``...completed`` with status "completed"
+    follows at utterance end.
+
+    Parameters:
+        type: Event type, always "conversation.item.input_audio_transcription.updated".
+        item_id: ID of the conversation item being transcribed.
+        transcript: Transcription text so far (full running text, not a delta).
+        content_index: Index of the content part being transcribed.
+    """
+
+    model_config = ConfigDict(extra="allow", arbitrary_types_allowed=True)
+
+    type: Literal["conversation.item.input_audio_transcription.updated"]
+    item_id: str | None = None
+    transcript: str | None = None
+    content_index: int | None = None
+
+
 class ConversationItemInputAudioTranscriptionCompleted(ServerEvent):
     """Event indicating input audio transcription is complete.
 
@@ -832,6 +855,7 @@ _server_event_types = {
     "conversation.created": ConversationCreated,
     "conversation.item.added": ConversationItemAdded,
     "conversation.item.input_audio_transcription.completed": ConversationItemInputAudioTranscriptionCompleted,
+    "conversation.item.input_audio_transcription.updated": ConversationItemInputAudioTranscriptionUpdated,
     "input_audio_buffer.speech_started": InputAudioBufferSpeechStarted,
     "input_audio_buffer.speech_stopped": InputAudioBufferSpeechStopped,
     "input_audio_buffer.committed": InputAudioBufferCommitted,
