@@ -90,14 +90,27 @@ class TurnDetection(BaseModel):
 #
 
 
+class InputAudioTranscription(BaseModel):
+    """Configuration for user-audio transcription.
+
+    xAI only emits input-audio transcription events when ``grok-transcribe``
+    is explicitly enabled on the realtime session.
+    """
+
+    model: Literal["grok-transcribe"] | str = "grok-transcribe"
+    language_hint: str | None = None
+
+
 class AudioInput(BaseModel):
     """Audio input configuration.
 
     Parameters:
         format: The format configuration for input audio.
+        transcription: Optional user-audio transcription configuration.
     """
 
     format: PCMAudioFormat | PCMUAudioFormat | PCMAAudioFormat | None = None
+    transcription: InputAudioTranscription | None = None
 
 
 class AudioOutput(BaseModel):
