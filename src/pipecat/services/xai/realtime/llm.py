@@ -12,7 +12,9 @@ https://docs.x.ai/docs/guides/voice/agent
 
 import base64
 import json
+import os
 import time
+from array import array
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from dataclasses import fields as dataclass_fields
@@ -69,6 +71,28 @@ except ModuleNotFoundError as e:
     logger.error(f"Exception: {e}")
     logger.error("In order to use Grok Realtime, you need to `pip install pipecat-ai[grok]`.")
     raise ImportError(f"Missing module: {e}") from e
+
+
+def _env_float(key: str, default: float) -> float:
+    """Float env read that survives empty and garbage values."""
+    raw = os.environ.get(key)
+    try:
+        return float(raw) if raw not in (None, "") else default
+    except ValueError:
+        return default
+
+
+def _pcm16_rms(data: bytes) -> float:
+    """RMS of little-endian PCM16 audio; 0.0 for empty/odd-length input."""
+    n = len(data) & ~1
+    if n == 0:
+        return 0.0
+    samples = array("h")
+    samples.frombytes(data[:n])
+    total = 0
+    for s in samples:
+        total += s * s
+    return (total / len(samples)) ** 0.5
 
 
 @dataclass
@@ -277,6 +301,27 @@ class GrokRealtimeLLMService(LLMService[GrokRealtimeLLMAdapter]):
         self.base_url = base_url
 
         self._audio_input_paused = start_audio_paused
+        # ── ECHO HALF-DUPLEX GATE (2026-08-26, run 7155 / deep-dive §7.4) ──
+        # Speakerphone legs feed Lucy's own sentences back into the inbound
+        # stream; on realtime lines the MODEL hears that audio directly, so no
+        # transcript filter can help — it re-asks questions it already asked
+        # (Adam: why-looking ×2, who-for ×2). While bot audio is playing
+        # (+ an acoustic-return tail), inbound frames at echo level are
+        # replaced with silence of the same length (cadence preserved);
+        # frames clearly above the adaptive echo floor (real barge-in) pass.
+        # The floor is seeded only by frames below _egate_floor_ceil so a
+        # customer talking over the bot cannot poison it against themselves.
+        # Kill switch: GROK_ECHO_HALF_DUPLEX_ENABLED=0.
+        self._egate_enabled = os.environ.get(
+            "GROK_ECHO_HALF_DUPLEX_ENABLED", "1"
+        ).strip().lower() not in ("0", "false", "no", "off")
+        self._egate_tail_s = _env_float("GROK_ECHO_HALF_DUPLEX_TAIL_S", 1.5)
+        self._egate_margin = 10.0 ** (_env_float("GROK_ECHO_HALF_DUPLEX_MARGIN_DB", 9.0) / 20.0)
+        self._egate_floor_ceil = _env_float("GROK_ECHO_HALF_DUPLEX_FLOOR_CEIL", 2500.0)
+        self._egate_play_until = 0.0
+        self._egate_floor = None
+        self._egate_silenced = 0
+        self._egate_passed = 0
         self._websocket = None
         self._receive_task = None
         self._context: LLMContext = None
@@ -722,6 +767,15 @@ class GrokRealtimeLLMService(LLMService[GrokRealtimeLLMAdapter]):
         audio = base64.b64decode(evt.delta)
         self._current_audio_response.total_size += len(audio)
 
+        # Echo gate: extend the bot-playback window by this chunk's duration.
+        # Deltas stream faster than realtime, so accumulating durations onto
+        # max(now, play_until) models when the LAST byte actually plays out.
+        if self._egate_enabled:
+            rate = self._get_output_sample_rate() or 24000
+            self._egate_play_until = (
+                max(time.time(), self._egate_play_until) + (len(audio) / 2.0) / rate
+            )
+
         frame = TTSAudioRawFrame(
             audio=audio,
             sample_rate=self._get_output_sample_rate(),
@@ -991,8 +1045,55 @@ class GrokRealtimeLLMService(LLMService[GrokRealtimeLLMAdapter]):
         if self._llm_needs_conversation_setup:
             return
 
-        payload = base64.b64encode(frame.audio).decode("utf-8")
+        audio = self._egate_filter(frame.audio) if self._egate_enabled else frame.audio
+        payload = base64.b64encode(audio).decode("utf-8")
         await self.send_client_event(events.InputAudioBufferAppendEvent(audio=payload))
+
+    def _egate_filter(self, data: bytes) -> bytes:
+        """Half-duplex echo gate (run 7155): inside the bot-playback window
+        (+ acoustic-return tail), replace echo-level inbound audio with
+        silence of the same length; pass frames clearly above the adaptive
+        echo floor (real barge-in). Cadence is preserved so the server-side
+        VAD sees a continuous stream."""
+        now = time.time()
+        if now >= self._egate_play_until + self._egate_tail_s:
+            if self._egate_silenced or self._egate_passed:
+                logger.info(
+                    f"egate window closed: silenced={self._egate_silenced} "
+                    f"passed={self._egate_passed} floor="
+                    f"{round(self._egate_floor) if self._egate_floor else None}"
+                )
+                self._egate_silenced = 0
+                self._egate_passed = 0
+            self._egate_floor = None
+            return data
+        rms = _pcm16_rms(data)
+        # Anything above the absolute ceiling is treated as real barge-in and
+        # never feeds the floor — a customer talking over the bot cannot raise
+        # the gate against themselves.
+        if rms > self._egate_floor_ceil:
+            self._egate_passed += 1
+            return data
+        # Frames at/below the ceiling are plausibly echo (or ambience). The
+        # floor tracks the LOUD side of that band: it rises fast on an echo
+        # burst and decays slowly through the silence between words, so quiet
+        # gaps cannot drag it down and let the next echoed sentence through.
+        floor = self._egate_floor
+        if floor is None:
+            self._egate_floor = rms
+        elif rms > floor:
+            self._egate_floor = 0.5 * floor + 0.5 * rms
+        else:
+            self._egate_floor = 0.95 * floor + 0.05 * rms
+        # Silence the frame when it is within the echo band: below the floor's
+        # margin, or below the ambient minimum outright. (The first frame of a
+        # brand-new echo burst can leak past a cold floor — one 20 ms blip.)
+        thresh = max((floor or 0.0) * self._egate_margin, 350.0)
+        if rms <= thresh:
+            self._egate_silenced += 1
+            return b"\x00" * len(data)
+        self._egate_passed += 1
+        return data
 
     async def _send_tool_result(self, tool_call_id: str, result: str):
         """Send a tool call result to Grok."""

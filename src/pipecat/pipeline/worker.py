@@ -91,6 +91,14 @@ IDLE_TIMEOUT_SECS = 300
 
 CANCEL_TIMEOUT_SECS = 20.0
 
+# How long a graceful close (EndFrame/StopFrame) may wait for the frame to
+# traverse the pipeline before we escalate to a hard cancel. Without this bound
+# a single blocked processor (a dead telephony websocket, a wedged LLM service)
+# parks `run()` forever: its `finally` never runs, `_cancel_tasks()` never
+# fires, and the heartbeat monitor whines every 10s as a zombie — 21 of them
+# accumulated on 2026-08-26 and poisoned shared clients (voice#200).
+END_TIMEOUT_SECS = 30.0
+
 
 T = TypeVar("T")
 
@@ -227,6 +235,7 @@ class PipelineWorker(BaseWorker):
         cancel_on_idle_timeout: bool = True,
         cancel_runner_on_idle_timeout: bool = True,
         cancel_timeout_secs: float = CANCEL_TIMEOUT_SECS,
+        end_timeout_secs: float = END_TIMEOUT_SECS,
         check_dangling_tasks: bool = True,
         clock: BaseClock | None = None,
         conversation_id: str | None = None,
@@ -336,6 +345,7 @@ class PipelineWorker(BaseWorker):
         self._cancel_on_idle_timeout = cancel_on_idle_timeout
         self._cancel_runner_on_idle_timeout = cancel_runner_on_idle_timeout
         self._cancel_timeout_secs = cancel_timeout_secs
+        self._end_timeout_secs = end_timeout_secs
         self._check_dangling_tasks = check_dangling_tasks
         self._clock = clock or SystemClock()
         self._conversation_id = conversation_id
@@ -973,8 +983,31 @@ class PipelineWorker(BaseWorker):
         if isinstance(frame, CancelFrame):
             await wait_for_cancel()
         else:
-            await self._pipeline_end_event.wait()
-            logger.debug(f"{self}: {frame} reached the end of the pipeline, pipeline is closing.")
+            # A graceful close must be BOUNDED. This wait used to be bare, and a
+            # single processor blocking the EndFrame (dead telephony websocket,
+            # wedged LLM service) parked run() forever — finally never ran,
+            # heartbeat tasks leaked, and 21 zombie workers accumulated on
+            # 2026-08-26 (voice#200). On timeout we escalate to a hard cancel,
+            # which traverses even where an EndFrame cannot (processors drop
+            # in-flight work instead of flushing it), and wait_for_cancel's own
+            # bounded wait + on_pipeline_finished keep the event contract.
+            try:
+                await asyncio.wait_for(
+                    self._pipeline_end_event.wait(), timeout=self._end_timeout_secs
+                )
+                logger.debug(
+                    f"{self}: {frame} reached the end of the pipeline, pipeline is closing."
+                )
+            except TimeoutError:
+                logger.warning(
+                    f"{self}: {frame} did not reach the end of the pipeline after "
+                    f"{self._end_timeout_secs}s (blocked processor?) — escalating to hard cancel"
+                )
+                self._cancelled = True
+                await self._pipeline.queue_frame(
+                    CancelFrame(reason="graceful close timed out")
+                )
+                await wait_for_cancel()
 
         self._pipeline_end_event.clear()
 
