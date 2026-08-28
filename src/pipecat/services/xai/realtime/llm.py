@@ -322,6 +322,12 @@ class GrokRealtimeLLMService(LLMService[GrokRealtimeLLMAdapter]):
         self._egate_floor = None
         self._egate_silenced = 0
         self._egate_passed = 0
+        # run 7590: frames loud enough to be speech (> the 350 ambient min) that
+        # we still silenced under the floor margin. passed==0 with a large
+        # contentious count is the caller-eaten signature; counted for the
+        # diagnostic below, NOT yet acted on (a blind fail-open would re-open
+        # the run-7155 echo storm).
+        self._egate_contentious = 0
         self._websocket = None
         self._receive_task = None
         self._context: LLMContext = None
@@ -1060,11 +1066,18 @@ class GrokRealtimeLLMService(LLMService[GrokRealtimeLLMAdapter]):
             if self._egate_silenced or self._egate_passed:
                 logger.info(
                     f"egate window closed: silenced={self._egate_silenced} "
-                    f"passed={self._egate_passed} floor="
+                    f"passed={self._egate_passed} "
+                    f"contentious={self._egate_contentious} floor="
                     f"{round(self._egate_floor) if self._egate_floor else None}"
                 )
+                if self._egate_passed == 0 and self._egate_contentious >= 40:
+                    logger.warning(
+                        f"egate MAY HAVE EATEN A CALLER: {self._egate_contentious} "
+                        "speech-loud frames silenced, zero passed (run-7590 signature)"
+                    )
                 self._egate_silenced = 0
                 self._egate_passed = 0
+                self._egate_contentious = 0
             self._egate_floor = None
             return data
         rms = _pcm16_rms(data)
@@ -1091,6 +1104,8 @@ class GrokRealtimeLLMService(LLMService[GrokRealtimeLLMAdapter]):
         thresh = max((floor or 0.0) * self._egate_margin, 350.0)
         if rms <= thresh:
             self._egate_silenced += 1
+            if rms > 350.0:
+                self._egate_contentious += 1
             return b"\x00" * len(data)
         self._egate_passed += 1
         return data
