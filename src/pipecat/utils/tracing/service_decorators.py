@@ -1420,10 +1420,18 @@ def traced_openai_realtime(operation: str) -> Callable:
                             if hasattr(self, "_context") and self._context:
                                 try:
                                     context_tools = getattr(self._context, "tools", None)
+                                    # A ToolsSchema is not JSON: use its standard tools' dicts
+                                    # (inshurik prod run 3001095 logged the error on every recovery).
+                                    std = getattr(context_tools, "standard_tools", None)
+                                    if std is not None:
+                                        context_tools = [
+                                            t.to_default_dict() if hasattr(t, "to_default_dict") else str(t)
+                                            for t in std
+                                        ]
                                     if context_tools and not operation_attrs.get("tools"):
                                         operation_attrs["tools"] = context_tools
                                         operation_attrs["tools_serialized"] = json.dumps(
-                                            context_tools
+                                            context_tools, default=str
                                         )
                                 except Exception as e:
                                     logger.warning(f"Error extracting context tools: {e}")
