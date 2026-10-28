@@ -28,7 +28,7 @@ dependencies = [
     "Markdown>=3.7,<4",
     "nltk>=3.9.4,<4",
     "numpy>=1.26.4,<3",
-    "Pillow>=11.1.0,<13",
+    "Pillow>=11.1.0,<14",
     "protobuf>=5.29.6,<7",
     "pydantic>=2.10.6,<3",
     "pyloudnorm~=0.2.0",
@@ -115,7 +115,7 @@ simli = [ "simli-ai~=2.0.1"]
 smallest = [ "pipecat-ai[websockets-base]" ]
 soniox = [ "pipecat-ai[websockets-base]" ]
 soundfile = [ "soundfile~=0.13.1" ]
-speechmatics = [ "speechmatics-voice[smart]~=0.2.8" ]
+speechmatics = [ "speechmatics-voice~=0.2.8" ]
 strands = [ "strands-agents>=1.9.1,<2" ]
 tavus = [ "pipecat-ai[daily]" ]
 together = []
