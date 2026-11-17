@@ -571,6 +571,7 @@ class LLMUserAggregator(LLMContextAggregator):
         context: LLMContext,
         *,
         params: LLMUserAggregatorParams | None = None,
+        _realtime_service_mode: bool | None = None,
         **kwargs,
     ):
         """Initialize the user context aggregator.
@@ -578,9 +579,14 @@ class LLMUserAggregator(LLMContextAggregator):
         Args:
             context: The LLM context for conversation storage.
             params: Configuration parameters for aggregation behavior.
+            _realtime_service_mode: Pair-internal. Set by
+                ``LLMContextAggregatorPair(realtime_service_mode=...)``. In this
+                fork it only keeps a transcription that arrives while the user
+                is muted (see ``process_frame``).
             **kwargs: Additional arguments.
         """
         params = params or LLMUserAggregatorParams()
+        self._realtime_service_mode = bool(_realtime_service_mode)
         super().__init__(
             context=context,
             role="user",
@@ -678,6 +684,13 @@ class LLMUserAggregator(LLMContextAggregator):
         await super().process_frame(frame, direction)
 
         if await self._maybe_mute_frame(frame):
+            # A realtime service transcribes audio it has already heard, and
+            # often delivers the transcript after its reply starts, when the
+            # user may be muted. Keep the text for the context; turn-taking
+            # stays muted (the turn strategies never see it). Ported from
+            # dograh-hq/pipecat d03e2292 (inshurik LUCY-598).
+            if self._realtime_service_mode and isinstance(frame, TranscriptionFrame):
+                await self._handle_transcription(frame)
             return
 
         if self._vad_controller:
@@ -1748,6 +1761,7 @@ class LLMContextAggregatorPair:
         user_params: LLMUserAggregatorParams | None = None,
         assistant_params: LLMAssistantAggregatorParams | None = None,
         add_tool_change_messages: bool | None = None,
+        realtime_service_mode: bool | None = None,
     ):
         """Initialize the LLM context aggregator pair.
 
@@ -1765,13 +1779,22 @@ class LLMContextAggregatorPair:
                 announcement is added exactly once (the second aggregator's
                 diff is empty by the time it sees the frame). Leave as
                 ``None`` to respect per-params settings.
+            realtime_service_mode: The pipeline's LLM is a speech-to-speech
+                (realtime) service. Upstream pipecat gives this flag wider
+                meaning; in this fork it only makes the user aggregator keep a
+                ``TranscriptionFrame`` that arrives while the user is muted,
+                adding it to the context without passing it to the user turn
+                strategies. Off (``None``/``False``) keeps the old behavior:
+                muted transcriptions are dropped.
         """
         user_params = user_params or LLMUserAggregatorParams()
         assistant_params = assistant_params or LLMAssistantAggregatorParams()
         if add_tool_change_messages is not None:
             user_params.add_tool_change_messages = add_tool_change_messages
             assistant_params.add_tool_change_messages = add_tool_change_messages
-        self._user = LLMUserAggregator(context, params=user_params)
+        self._user = LLMUserAggregator(
+            context, params=user_params, _realtime_service_mode=realtime_service_mode
+        )
         self._assistant = LLMAssistantAggregator(context, params=assistant_params)
 
     def user(self) -> LLMUserAggregator:
