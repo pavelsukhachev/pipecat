@@ -863,5 +863,71 @@ class TestCJKProcessWordFlagPropagation(unittest.TestCase):
         )
 
 
+# ---------------------------------------------------------------------------
+# Logs carry ids and character counts, never the reply's text (inshurik LUCY-599)
+# ---------------------------------------------------------------------------
+
+# Stand-ins for a customer's details read back: a date of birth and account digits.
+_DOB = "04171951"
+_ACCT = "662300"
+
+
+class TestLogsCarryNoText(unittest.TestCase):
+    def setUp(self):
+        self.records = []
+        self._sink = logger.add(
+            lambda m: self.records.append(m.record), level=0, format="{message}"
+        )
+
+    def tearDown(self):
+        logger.remove(self._sink)
+
+    def assertNoText(self, *fragments):
+        messages = [r["message"] for r in self.records]
+        self.assertTrue(messages, "the path under test logged nothing")
+        for fragment in fragments:
+            self.assertFalse(any(fragment in m for m in messages), fragment)
+
+    def test_force_complete_mismatch_warning(self):
+        seq = _seq()
+        seq.register_spoken(
+            _spoken_frame(_DOB),
+            "ctx1",
+            WordCompletionTracker(_DOB, llm_text=_ACCT),
+            append_to_context=True,
+        )
+        seq.force_complete(last_word_pts=0)
+        self.assertTrue(any("does not contain" in r["message"] for r in self.records))
+        self.assertNoText(_DOB, _ACCT)
+
+    def test_force_complete_debug(self):
+        seq = _seq()
+        seq.register_spoken(_spoken_frame(_DOB), "ctx1", _tracker(_DOB), True)
+        seq.force_complete(last_word_pts=0)
+        self.assertTrue(any("force-completing" in r["message"] for r in self.records))
+        self.assertNoText(_DOB)
+
+    def test_unrecognised_word_warning(self):
+        seq = _seq()
+        seq.register_spoken(_spoken_frame("hello world"), "ctx1", _tracker("hello world"), True)
+        seq.process_word(_DOB, pts=5, context_id="ctx1")
+        self.assertNoText(_DOB)
+
+    def test_overflow_word_debug(self):
+        seq = _seq()
+        seq.register_spoken(_spoken_frame(_DOB), "ctx1", _tracker(_DOB), True)
+        seq.register_spoken(_spoken_frame(_ACCT), "ctx2", _tracker(_ACCT), True)
+        seq.process_word(_DOB + _ACCT, pts=100, context_id="ctx1")
+        self.assertNoText(_ACCT, _DOB)
+
+    def test_flushing_a_skipped_frame_debug(self):
+        seq = _seq()
+        seq.register_spoken(_spoken_frame("hello"), "ctx1", _tracker("hello"), True)
+        seq.register_skipped(_skipped_frame(_ACCT), "ctx2", None)
+        seq.force_complete(last_word_pts=0)
+        self.assertTrue(any("Flushing" in r["message"] for r in self.records))
+        self.assertNoText(_ACCT)
+
+
 if __name__ == "__main__":
     unittest.main()

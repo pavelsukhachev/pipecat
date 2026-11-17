@@ -38,6 +38,8 @@ class _AggregatedFrameSlot:
     includes_inter_frame_spaces: bool = False
 
 
+# Log lines here carry ids and character counts, never text: an assistant reply can
+# carry a customer's personal details read back (inshurik LUCY-599 security review).
 class AggregatedFrameSequencer:
     """Sequences AggregatedTextFrame slots to preserve TTS context ordering.
 
@@ -176,7 +178,7 @@ class AggregatedFrameSequencer:
                 )
                 if not word_fits_next:
                     logger.warning(
-                        f"{self._name} Word '{word}' not recognised by any slot, "
+                        f"{self._name} a word ({len(word)} chars) not recognised by any slot, "
                         "emitting as passthrough"
                     )
                     return [
@@ -220,7 +222,9 @@ class AggregatedFrameSequencer:
             active.complete = True
             frames.extend(self.flush(last_word_pts=pts))
             if raw_overflow_word:
-                logger.debug(f"{self._name} Emitting overflow word '{raw_overflow_word}'")
+                logger.debug(
+                    f"{self._name} Emitting an overflow word ({len(raw_overflow_word)} chars)"
+                )
                 frames.extend(self._process_overflow(raw_overflow_word, pts))
 
         return frames
@@ -264,7 +268,10 @@ class AggregatedFrameSequencer:
                 slot.frame.transport_destination = slot.transport_destination
                 if last_word_pts:
                     slot.frame.pts = last_word_pts
-                logger.debug(f"{self._name}: Flushing Aggregated Frame {slot.frame}")
+                logger.debug(
+                    f"{self._name}: Flushing {type(slot.frame).__name__} "
+                    f"context={slot.context_id} ({len(slot.frame.text or '')} chars)"
+                )
                 frames.append(slot.frame)
                 slot.complete = True
                 self._slots.pop(0)
@@ -299,8 +306,9 @@ class AggregatedFrameSequencer:
                     raw_remaining = slot.tracker.get_remaining_llm_text()
                     if raw_remaining and remaining_text and remaining_text not in raw_remaining:
                         logger.warning(
-                            f"{self._name} force-complete: raw_remaining {repr(raw_remaining)} "
-                            f"does not contain remaining_text {repr(remaining_text)}, discarding"
+                            f"{self._name} force-complete: context {slot.context_id} raw_remaining "
+                            f"({len(raw_remaining)} chars) does not contain remaining_text "
+                            f"({len(remaining_text)} chars), discarding"
                         )
                         raw_remaining = None
                     if remaining_text and not emit_remaining:
@@ -312,8 +320,8 @@ class AggregatedFrameSequencer:
                         )
                     elif remaining_text:
                         logger.debug(
-                            f"{self._name} force-completing slot with remaining text "
-                            f"{repr(remaining_text)}"
+                            f"{self._name} force-completing context {slot.context_id} slot "
+                            f"with remaining text ({len(remaining_text)} chars)"
                         )
                         frames.append(
                             self._build_word_frame(
