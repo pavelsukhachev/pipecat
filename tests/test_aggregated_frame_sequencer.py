@@ -22,6 +22,8 @@ Test groups:
 
 import unittest
 
+from loguru import logger
+
 from pipecat.frames.frames import AggregatedTextFrame, AggregationType, TTSTextFrame
 from pipecat.utils.context.aggregated_frame_sequencer import AggregatedFrameSequencer
 from pipecat.utils.context.word_completion_tracker import WordCompletionTracker
@@ -402,8 +404,19 @@ class TestForceComplete(unittest.TestCase):
         seq = _seq()
         seq.register_spoken(_spoken_frame("hello world"), "ctx1", _tracker("hello world"), True)
 
-        result = seq.force_complete(last_word_pts=0, emit_remaining=False)
+        records = []
+        sink_id = logger.add(lambda m: records.append(m.record), level=0, format="{message}")
+        try:
+            result = seq.force_complete(last_word_pts=0, emit_remaining=False)
+        finally:
+            logger.remove(sink_id)
         self.assertEqual(result, [])
+        # Metadata only: the dropped text can carry a customer's personal details.
+        messages = [r["message"] for r in records]
+        self.assertFalse(any("hello" in m or "world" in m for m in messages), messages)
+        self.assertTrue(
+            any(r["level"].name == "WARNING" and "(11 chars)" in r["message"] for r in records)
+        )
 
     def test_flushes_skipped_frames_without_audio(self):
         seq = _seq()

@@ -1484,17 +1484,19 @@ class TTSService(AIService):
 
     async def _release_held_frames_without_audio(self, context_id: str, held_frames: list[Frame]):
         """Drop the held spoken text of a context without audio, and push the rest."""
-        dropped_text = ""
+        dropped_chars = 0
         for frame in held_frames:
             if isinstance(frame, TTSTextFrame):
-                dropped_text += frame.text
+                dropped_chars += len(frame.text)
             else:
                 await self.push_frame(frame)
         held_frames.clear()
-        if dropped_text:
+        if dropped_chars:
+            # Metadata only: the reply can carry a customer's personal details
+            # read back, so its text is never logged.
             logger.warning(
                 f"{self} audio context {context_id} produced no audio, "
-                f"not adding [{dropped_text}] to the context"
+                f"not adding its text ({dropped_chars} chars) to the context"
             )
 
     async def _handle_audio_context(self, context_id: str):

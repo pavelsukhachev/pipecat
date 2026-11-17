@@ -17,6 +17,7 @@ import asyncio
 from collections.abc import AsyncGenerator, Sequence
 
 import pytest
+from loguru import logger
 
 from pipecat.frames.frames import (
     Frame,
@@ -160,3 +161,38 @@ async def test_audio_arriving_after_the_timeout_adds_no_text():
     down, _ = await asyncio.wait_for(run_test(tts, frames_to_send=_speak("Hello there.")), 5.0)
 
     assert _context_text(down) == []
+
+
+# A reply can carry a customer's personal details read back (a name, a date of birth,
+# bank digits). The no-audio warnings must say how much was dropped, never what.
+_SECRET = "Your date of birth is 04/17/1951 and the account ends 6623."
+
+
+@pytest.fixture
+def log_records():
+    records = []
+    sink_id = logger.add(lambda m: records.append(m.record), level=0, format="{message}")
+    yield records
+    logger.remove(sink_id)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("push_text_frames", [True, False])
+async def test_the_dropped_text_is_never_logged(push_text_frames, log_records):
+    tts = MockTTSService(speaks=False, push_text_frames=push_text_frames)
+
+    down, _ = await asyncio.wait_for(run_test(tts, frames_to_send=_speak(_SECRET)), 5.0)
+
+    assert not any(isinstance(f, TTSTextFrame) for f in down)
+    # DEBUG and up: pipecat's generic TRACE frame dump (off in production) prints every
+    # frame's text and is out of scope here.
+    messages = [r["message"] for r in log_records if r["level"].no >= 10]
+    for fragment in ("04/17/1951", "6623", "date of birth"):
+        assert not any(fragment in m for m in messages), fragment
+    warnings = [
+        r["message"]
+        for r in log_records
+        if r["level"].name == "WARNING" and "produced no audio" in r["message"]
+    ]
+    assert warnings, "the drop is still reported"
+    assert any(f"({len(_SECRET)} chars)" in w for w in warnings)

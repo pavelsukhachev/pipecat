@@ -304,9 +304,11 @@ class AggregatedFrameSequencer:
                         )
                         raw_remaining = None
                     if remaining_text and not emit_remaining:
+                        # Metadata only: the text can carry a customer's personal
+                        # details, so it is never logged.
                         logger.warning(
                             f"{self._name} context {slot.context_id} produced no audio, "
-                            f"dropping unspoken text {repr(remaining_text)}"
+                            f"dropping its unspoken text ({len(remaining_text)} chars)"
                         )
                     elif remaining_text:
                         logger.debug(
