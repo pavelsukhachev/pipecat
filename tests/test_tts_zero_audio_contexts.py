@@ -103,6 +103,31 @@ class MockLateAudioTTSService(TTSService):
             yield
 
 
+class MockStoppedWithoutAudioTTSService(TTSService):
+    """Word-timestamp service whose provider ends the context with no audio at all.
+
+    The provider's "done" arrives as a TTSStoppedFrame in the audio context, so the
+    context is closed by the TTSStoppedFrame branch of the playback loop rather than
+    by the end-of-context path.
+    """
+
+    def __init__(self, **kwargs):
+        super().__init__(
+            push_start_frame=True,
+            push_stop_frames=True,
+            push_text_frames=False,
+            sample_rate=_SAMPLE_RATE,
+            stop_frame_timeout_s=_STOP_FRAME_TIMEOUT_S,
+            **kwargs,
+        )
+
+    def can_generate_metrics(self) -> bool:
+        return False
+
+    async def run_tts(self, text: str, context_id: str) -> AsyncGenerator[Frame, None]:
+        yield TTSStoppedFrame(context_id=context_id)
+
+
 def _speak(*texts: str) -> list[Frame]:
     frames: list[Frame] = []
     for text in texts:
@@ -160,6 +185,20 @@ async def test_audio_arriving_after_the_timeout_adds_no_text():
 
     down, _ = await asyncio.wait_for(run_test(tts, frames_to_send=_speak("Hello there.")), 5.0)
 
+    assert _context_text(down) == []
+
+
+@pytest.mark.asyncio
+async def test_a_stopped_frame_without_audio_keeps_the_text_out_of_the_context():
+    # Word-timestamp service, provider ends the context with TTSStoppedFrame and no audio:
+    # the force-complete in the TTSStoppedFrame branch must drop the unheard text, not
+    # emit it (second review of LUCY-599: that call was otherwise unprotected).
+    tts = MockStoppedWithoutAudioTTSService()
+
+    down, _ = await asyncio.wait_for(run_test(tts, frames_to_send=_speak("Hello there.")), 5.0)
+
+    assert any(isinstance(f, TTSStoppedFrame) for f in down)
+    assert not any(isinstance(f, TTSTextFrame) for f in down)
     assert _context_text(down) == []
 
 
