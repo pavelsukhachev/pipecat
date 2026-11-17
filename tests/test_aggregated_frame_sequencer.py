@@ -397,6 +397,23 @@ class TestForceComplete(unittest.TestCase):
         self.assertEqual(len(tts_frames), 1)
         self.assertEqual(tts_frames[0].text, "hello world")
 
+    def test_drops_remaining_text_without_audio(self):
+        # inshurik LUCY-599 (upstream pipecat-ai/pipecat#6234): nothing was spoken.
+        seq = _seq()
+        seq.register_spoken(_spoken_frame("hello world"), "ctx1", _tracker("hello world"), True)
+
+        result = seq.force_complete(last_word_pts=0, emit_remaining=False)
+        self.assertEqual(result, [])
+
+    def test_flushes_skipped_frames_without_audio(self):
+        seq = _seq()
+        seq.register_spoken(_spoken_frame("hello"), "ctx1", _tracker("hello"), True)
+        skipped = _skipped_frame("code")
+        seq.register_skipped(skipped, "ctx2", None)
+
+        result = seq.force_complete(last_word_pts=20, emit_remaining=False)
+        self.assertEqual(result, [skipped])
+
     def test_already_complete_slot_emits_nothing(self):
         seq = _seq()
         seq.register_spoken(_spoken_frame("hi"), "ctx1", _tracker("hi"), True)
