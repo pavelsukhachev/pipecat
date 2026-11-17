@@ -162,6 +162,63 @@ class TestRealtimeMutedTranscription(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(_user_texts(context), ["Yes. It is 35 Main Street."])
 
+    async def test_lucy_production_stop_strategy_keeps_muted_words(self):
+        # The exact strategies Inshurik's run_pipeline builds for Grok
+        # (_create_realtime_user_turn_config → external_provider_turn_config):
+        # ExternalUserTurnStartStrategy() + ExternalUserTurnStopStrategy(wait_for_transcript=False),
+        # with its default 0.5 s timeout. In this fork wait_for_transcript is not a
+        # parameter of the strategy (BaseObject accepts and ignores it), so this pins the
+        # behaviour the production constructor actually gets.
+        context = LLMContext()
+        user, assistant = LLMContextAggregatorPair(
+            context,
+            user_params=LLMUserAggregatorParams(
+                user_turn_strategies=UserTurnStrategies(
+                    start=[ExternalUserTurnStartStrategy()],
+                    stop=[ExternalUserTurnStopStrategy(wait_for_transcript=False)],
+                ),
+                user_mute_strategies=[_MuteWhileBotSpeaks()],
+            ),
+            realtime_service_mode=True,
+        )
+        turns_started = []
+        turns_stopped = []
+
+        @user.event_handler("on_user_turn_started")
+        async def _on_start(_aggregator, _strategy):
+            turns_started.append(True)
+
+        @user.event_handler("on_user_turn_stopped")
+        async def _on_stop(_aggregator, _strategy, message):
+            turns_stopped.append(message.content)
+
+        await run_test(
+            Pipeline([user, assistant]),
+            frames_to_send=[
+                # Lucy is speaking; the caller's answer to her last question lands now.
+                BotStartedSpeakingFrame(),
+                SleepFrame(),
+                _transcript("My account ends 6623."),
+                SleepFrame(sleep=0.7),  # longer than the strategy's 0.5 s timeout
+                BotStoppedSpeakingFrame(),
+                SleepFrame(),
+                # The caller's next turn: Grok's speech_started / speech_stopped, then its final.
+                UserStartedSpeakingFrame(),
+                SleepFrame(),
+                UserStoppedSpeakingFrame(),
+                SleepFrame(sleep=0.1),
+                _transcript("Yes, that is right."),
+                SleepFrame(sleep=0.7),
+            ],
+            expected_down_frames=None,
+        )
+
+        # Nothing the caller said is lost, nothing is recorded twice, in the order said.
+        self.assertEqual(_user_texts(context), ["My account ends 6623. Yes, that is right."])
+        # The muted words never ran turn-taking on their own: the only turn is the caller's next one.
+        self.assertEqual(len(turns_started), 1)
+        self.assertEqual(turns_stopped, ["My account ends 6623. Yes, that is right."])
+
 
 if __name__ == "__main__":
     unittest.main()
