@@ -1990,9 +1990,12 @@ class TTSService(AIService):
         if self.is_usable:
             await self.tts_process_generator(context_id, self.run_tts(text, context_id))
         else:
-            # Name the text that goes unspoken: silence from the bot is
-            # otherwise hard to trace back to the service that caused it.
-            logger.warning(f"{self}: service is no longer usable, not speaking [{text}]")
+            # Say that text goes unspoken (its length, never the text: it is
+            # what the bot was about to say): silence from the bot is otherwise
+            # hard to trace back to the service that caused it.
+            logger.warning(
+                f"{self}: service is no longer usable, not speaking ({len(text)} chars)"
+            )
 
     async def _push_spoken_text(
         self, src_frame: AggregatedTextFrame, text: str, context_id: str, append_to_context: bool

@@ -594,7 +594,8 @@ class GoogleInteractionsLLMService(LLMService[GeminiInteractionsLLMAdapter]):
                 arguments = json.loads(call["arguments"])
             except json.JSONDecodeError:
                 logger.warning(
-                    f"{self}: Failed to parse function call arguments: {call['arguments']}"
+                    f"{self}: Failed to parse function call arguments "
+                    f"({len(call['arguments'])} chars)"
                 )
         logger.debug(f"Function call: {call['name']}:{call['id']}")
         return FunctionCallFromLLM(
