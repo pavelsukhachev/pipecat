@@ -237,6 +237,8 @@ class _StreamingContext:
     text_type: TextType | str = TextType.SENTENCE
 
 
+# Log lines here carry ids and character counts, never text: an assistant reply can
+# carry a customer's personal details read back (inshurik LUCY-599 security review).
 class AggregatedFrameSequencer:
     """Sequences AggregatedTextFrame slots to preserve TTS context ordering.
 
@@ -513,8 +515,8 @@ class AggregatedFrameSequencer:
             and not is_pending_streaming_ctx
         ):
             logger.debug(
-                f"{self._name} Dropping stale word '{word}' from unknown/cleared "
-                f"context {context_id}"
+                f"{self._name} Dropping a stale word ({len(word)} chars) from "
+                f"unknown/cleared context {context_id}"
             )
             return []
 
@@ -544,7 +546,8 @@ class AggregatedFrameSequencer:
                     # Only text no later word accounts for waits for
                     # force_complete, when the audio context ends.
                     logger.warning(
-                        f"{self._name} Dropping word '{word}' not recognised by any slot."
+                        f"{self._name} Dropping a word ({len(word)} chars) not recognised "
+                        "by any slot."
                     )
                     return []
 
@@ -590,7 +593,9 @@ class AggregatedFrameSequencer:
             active.complete = True
             frames.extend(self.flush(last_word_pts=pts))
             if raw_overflow_word:
-                logger.debug(f"{self._name} Emitting overflow word '{raw_overflow_word}'")
+                logger.debug(
+                    f"{self._name} Emitting an overflow word ({len(raw_overflow_word)} chars)"
+                )
                 frames.extend(self.process_word(raw_overflow_word, pts, context_id))
 
         return frames
@@ -639,7 +644,10 @@ class AggregatedFrameSequencer:
                 slot.frame.transport_destination = slot.transport_destination
                 if last_word_pts:
                     slot.frame.pts = last_word_pts
-                logger.debug(f"{self._name}: Flushing Aggregated Frame {slot.frame}")
+                logger.debug(
+                    f"{self._name}: Flushing {type(slot.frame).__name__} "
+                    f"context={slot.context_id} ({len(slot.frame.text or '')} chars)"
+                )
                 frames.append(slot.frame)
                 slot.complete = True
                 self._slots.pop(0)
@@ -713,14 +721,14 @@ class AggregatedFrameSequencer:
                     if remaining_text and not emit_remaining:
                         logger.warning(
                             f"{self._name} context {context_id} produced no audio, "
-                            f"dropping unspoken text {repr(remaining_text)}"
+                            f"dropping its unspoken text ({len(remaining_text)} chars)"
                         )
                     # A slot that is only tags, such as a sound, has LLM text and
                     # nothing left to say.
                     elif remaining_text or raw_remaining:
                         logger.debug(
-                            f"{self._name} force-completing slot with remaining text "
-                            f"{repr(remaining_text)}"
+                            f"{self._name} force-completing context {slot.context_id} slot "
+                            f"with remaining text ({len(remaining_text)} chars)"
                         )
                         frames.append(
                             self._build_word_frame(
@@ -911,7 +919,8 @@ class AggregatedFrameSequencer:
                 keep.append(w)
                 continue
             logger.warning(
-                f"{self._name} Dropping buffered word '{w.word}' not recognised by any slot."
+                f"{self._name} Dropping a buffered word ({len(w.word)} chars) not "
+                "recognised by any slot."
             )
         self._buffered_words = keep
 

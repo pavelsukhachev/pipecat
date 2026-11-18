@@ -1433,7 +1433,7 @@ class TTSService(AIService):
 
         # Log accumulated streamed text and emit aggregated usage metric.
         if self._streamed_text:
-            logger.debug(f"{self}: Generating TTS [{self._streamed_text}]")
+            logger.debug(f"{self}: Generating TTS ({len(self._streamed_text)} chars)")
             await super().start_tts_usage_metrics(self._streamed_text)
             self._streamed_text = ""
 
@@ -1976,11 +1976,12 @@ class TTSService(AIService):
     async def _synthesize_text(self, text: str, context_id: str):
         """Run the service's run_tts for text, unless the service is no longer usable."""
         # When streaming tokens, per-call logs are kept at trace level; the
-        # accumulated turn text is logged at debug level at flush time.
+        # accumulated turn is logged at debug level at flush time. Lengths only:
+        # a reply can read back a customer's personal details (inshurik LUCY-603).
         if self._is_streaming_tokens:
-            logger.trace(f"{self}: Generating TTS [{text}]")
+            logger.trace(f"{self}: Generating TTS ({len(text)} chars)")
         else:
-            logger.debug(f"{self}: Generating TTS [{text}]")
+            logger.debug(f"{self}: Generating TTS ({len(text)} chars)")
 
         # A service that can no longer work can't synthesize anything, and
         # services that connect on demand would attempt a handshake per request.
@@ -2170,17 +2171,19 @@ class TTSService(AIService):
         self, context_id: str, playback: _AudioContextPlayback
     ):
         """Drop the held spoken text of a context without audio, and push the rest."""
-        dropped_text = ""
+        dropped_chars = 0
         for frame in playback.held_frames:
             if isinstance(frame, TTSTextFrame):
-                dropped_text += frame.text
+                dropped_chars += len(frame.text)
             else:
                 await self.push_frame(frame)
         playback.held_frames.clear()
-        if dropped_text:
+        if dropped_chars:
+            # Metadata only: the reply can carry a customer's personal details
+            # read back, so its text is never logged (inshurik LUCY-599).
             logger.warning(
                 f"{self} audio context {context_id} produced no audio, "
-                f"not adding [{dropped_text}] to the context"
+                f"not adding its text ({dropped_chars} chars) to the context"
             )
 
     #

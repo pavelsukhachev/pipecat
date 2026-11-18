@@ -636,7 +636,7 @@ class BaseOpenAILLMService(LLMService[OpenAILLMAdapter]):
                                 chunk = await chunk_iter.__anext__()
                         except StopAsyncIteration:
                             break
-                        except asyncio.TimeoutError:
+                        except TimeoutError:
                             first_token_timed_out = True
                             break
                         if chunk.usage:
@@ -731,7 +731,12 @@ class BaseOpenAILLMService(LLMService[OpenAILLMAdapter]):
                 try:
                     arguments = json.loads(arguments)
                 except json.JSONDecodeError:
-                    logger.warning(f"{self}: Failed to parse function call arguments: {arguments}")
+                    # Arguments can carry what the caller said (names, dates of
+                    # birth): log the size only (inshurik LUCY-603).
+                    logger.warning(
+                        f"{self}: Failed to parse function call arguments "
+                        f"for {function_name} ({len(arguments)} chars)"
+                    )
                     continue
                 function_calls.append(
                     FunctionCallFromLLM(
@@ -754,7 +759,7 @@ class BaseOpenAILLMService(LLMService[OpenAILLMAdapter]):
             text_generated = has_alnum(generated_content)
             if generated_content and not text_generated:
                 logger.info(
-                    f"{self}: no speakable content ({generated_content[:120]!r}); "
+                    f"{self}: no speakable content ({len(generated_content)} chars); "
                     "running function calls without waiting for TTS"
                 )
             await self._run_or_defer_function_calls(
