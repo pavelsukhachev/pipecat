@@ -11,8 +11,8 @@ import time
 from abc import ABC, abstractmethod
 from collections.abc import Awaitable, Callable
 
-import websockets
 from loguru import logger
+from websockets.asyncio.client import ClientConnection
 from websockets.exceptions import ConnectionClosedError, ConnectionClosedOK
 from websockets.protocol import State
 
@@ -42,12 +42,39 @@ class WebsocketService(ABC):
             reconnect_on_error: Whether to automatically reconnect on connection errors.
             **kwargs: Additional arguments (unused, for compatibility).
         """
-        self._websocket: websockets.WebSocketClientProtocol | None = None  # pyright: ignore[reportAttributeAccessIssue]
         self._reconnect_on_error = reconnect_on_error
         self._reconnect_in_progress: bool = False
         self._disconnecting: bool = False
         self._quick_failure_count: int = 0
         self._last_connect_time: float = 0.0
+
+    # Class-level default so `_websocket` reads None before `__init__` runs:
+    # some subclasses initialize their other bases first.
+    __websocket_connection: ClientConnection | None = None
+
+    @property
+    def _websocket(self) -> ClientConnection | None:
+        """The connection the service is using, if any.
+
+        Replacing or clearing it aborts the connection it held unless that
+        connection is already closed, so the service never loses track of an
+        open connection. The abort is synchronous: a disconnect cancelled
+        before its close completes still ends the connection when it clears
+        the reference.
+        """
+        return self.__websocket_connection
+
+    @_websocket.setter
+    def _websocket(self, websocket: ClientConnection | None):
+        previous = self.__websocket_connection
+        if (
+            previous is not websocket
+            and isinstance(previous, ClientConnection)
+            and previous.state is not State.CLOSED
+        ):
+            logger.debug(f"{self}: dropping a websocket connection that is still open, aborting it")
+            previous.transport.abort()
+        self.__websocket_connection = websocket
 
     async def _verify_connection(self) -> bool:
         """Verify the websocket connection is active and responsive.
