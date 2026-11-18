@@ -493,6 +493,13 @@ class ElevenLabsTTSService(ElevenLabsTTSBase):
         # which contexts are safe to target.
         self._context_init_sent: set[str] = set()
 
+        # Inshurik: ElevenLabs accepts voice_settings only in the FIRST message of
+        # a WebSocket connection and rejects a re-send, even with identical values,
+        # with a 1008 policy violation (enforced since ~2026-05-26; 60% of calls
+        # hit ~6 s TTS stalls). Only the first context-init per connection
+        # carries them.
+        self._connection_voice_settings_sent: bool = False
+
     @classmethod
     def format_pronunciation(cls, word: str, ipa: str) -> str | None:
         """Render a pronunciation as SSML ``<phoneme>`` tags.
@@ -562,6 +569,28 @@ class ElevenLabsTTSService(ElevenLabsTTSBase):
 
     def _clear_connection_state(self):
         self._context_init_sent.clear()
+        self._connection_voice_settings_sent = False
+
+    async def _update_settings(self, delta: TTSSettings) -> dict[str, Any]:
+        """Apply a settings delta; a voice-settings change reconnects.
+
+        voice_settings can only ride on a connection's first message, so new
+        values take effect on a fresh connection.
+
+        Args:
+            delta: A :class:`TTSSettings` (or service-specific ``Settings``) delta.
+
+        Returns:
+            Dict mapping changed field names to their previous values.
+        """
+        changed = await super()._update_settings(delta)
+        url_changed = bool(changed.keys() & self.Settings.URL_FIELDS)
+        voice_settings_changed = bool(changed.keys() & self.Settings.VOICE_SETTINGS_FIELDS)
+        if voice_settings_changed and not url_changed and self._connection_voice_settings_sent:
+            logger.debug(f"{self}: voice settings changed, reconnecting WebSocket to apply them")
+            await self._disconnect()
+            await self._connect()
+        return changed
 
     async def _close_context(self, context_id: str):
         # ElevenLabs requires that Pipecat explicitly closes contexts to free
@@ -682,8 +711,9 @@ class ElevenLabsTTSService(ElevenLabsTTSBase):
         # context_id.
         self._context_init_sent.add(context_id)
         msg: dict[str, Any] = {"text": " ", "context_id": context_id}
-        if self._voice_settings:
+        if self._voice_settings and not self._connection_voice_settings_sent:
             msg["voice_settings"] = self._voice_settings
+            self._connection_voice_settings_sent = True
         if self._pronunciation_dictionary_locators:
             msg["pronunciation_dictionary_locators"] = [
                 locator.model_dump() for locator in self._pronunciation_dictionary_locators
