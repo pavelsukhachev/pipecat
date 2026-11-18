@@ -691,7 +691,11 @@ class LLMService(UserTurnCompletionLLMServiceMixin, AIService, Generic[TAdapter]
             parts.append(self._user_turn_completion_config.completion_instructions)
         if self._cancel_tool_names:
             parts.append(ASYNC_TOOL_CANCELLATION_INSTRUCTIONS)
-        if self._has_async_tools():
+        # Inshurik: the async-tool guidance is composed in only with
+        # ``enable_async_tool_cancellation``. A tool registered with
+        # ``cancel_on_interruption=False`` just to survive barge-in must not
+        # change the prompt the model is given.
+        if self._enable_async_tool_cancellation and self._has_async_tools():
             parts.append(ASYNC_TOOL_INSTRUCTIONS)
         composed = "\n\n".join(p for p in parts if p) or None
         self._settings.system_instruction = composed
