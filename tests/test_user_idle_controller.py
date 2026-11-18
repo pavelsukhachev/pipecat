@@ -145,7 +145,7 @@ class TestUserIdleController(unittest.IsolatedAsyncioTestCase):
         (re)started and idle never fired (multi-minute dead air). It must now fire.
         """
         controller = UserIdleController(user_idle_timeout=USER_IDLE_TIMEOUT)
-        await controller.setup(self.task_manager)
+        await controller.setup(frame_processor_setup(self.task_manager))
 
         idle_triggered = False
 
@@ -171,7 +171,7 @@ class TestUserIdleController(unittest.IsolatedAsyncioTestCase):
         The BotStopped branch starts it once the bot actually finishes.
         """
         controller = UserIdleController(user_idle_timeout=USER_IDLE_TIMEOUT)
-        await controller.setup(self.task_manager)
+        await controller.setup(frame_processor_setup(self.task_manager))
 
         idle_triggered = False
 
@@ -197,7 +197,7 @@ class TestUserIdleController(unittest.IsolatedAsyncioTestCase):
     async def test_user_stops_during_function_call_no_timer(self):
         """UserStopped while a function call is in flight must NOT start the timer."""
         controller = UserIdleController(user_idle_timeout=USER_IDLE_TIMEOUT)
-        await controller.setup(self.task_manager)
+        await controller.setup(frame_processor_setup(self.task_manager))
 
         idle_triggered = False
 
