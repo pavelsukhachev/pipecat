@@ -1729,6 +1729,9 @@ class LLMAssistantAggregator(LLMContextAggregator):
         # Inshurik patch 4: the aggregation generation the current LLM response
         # started in; see `_handle_text`.
         self._active_llm_generation: int = 0
+        # The generation an interruption's reset() left behind, until the next
+        # LLM response starts: text in it may come from a stream still draining.
+        self._interrupted_generation: int | None = None
 
         self._thought_append_to_context = False
         self._thought_llm: str = ""
@@ -1993,6 +1996,7 @@ class LLMAssistantAggregator(LLMContextAggregator):
     async def _handle_interruptions(self, frame: InterruptionFrame):
         await self._trigger_assistant_turn_stopped(interrupted=True)
         await self.reset()
+        self._interrupted_generation = self._aggregation_generation
 
     async def _handle_end_or_cancel(self, frame: Frame):
         await self._trigger_assistant_turn_stopped(interrupted=isinstance(frame, CancelFrame))
@@ -2287,6 +2291,7 @@ class LLMAssistantAggregator(LLMContextAggregator):
 
     async def _handle_llm_start(self, _: LLMFullResponseStartFrame):
         self._active_llm_generation = self._aggregation_generation
+        self._interrupted_generation = None
         # Realtime mode treats LLMFullResponseStartFrame as the user
         # turn's end signal for context-writing purposes — see
         # _realtime_handle_llm_start.
@@ -2324,6 +2329,12 @@ class LLMAssistantAggregator(LLMContextAggregator):
         # utterances that have no surrounding LLM response frames to signal assistant
         # turn boundaries, while rightly deferring to any earlier LLM-driven turn start.
         if frame.append_to_context and not self._assistant_turn_start_timestamp:
+            # Inshurik patch 4: a TTSSpeakFrame utterance has no
+            # LLMFullResponseStartFrame, so its text is taken in the current
+            # generation here. Not straight after an interruption, where the
+            # TTSStartedFrame may belong to a stream that is still draining.
+            if self._aggregation_generation != self._interrupted_generation:
+                self._active_llm_generation = self._aggregation_generation
             await self._trigger_assistant_turn_started()
 
     async def _handle_push_aggregation(self):
