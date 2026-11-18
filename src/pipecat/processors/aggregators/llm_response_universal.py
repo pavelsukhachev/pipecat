@@ -485,6 +485,10 @@ class LLMContextAggregator(FrameProcessor):
         self._add_tool_change_messages = add_tool_change_messages
 
         self._aggregation: list[TextPartForConcatenation] = []
+        # Inshurik patch 4: bumped on every reset() so text from a response that
+        # started before the reset (a stream still draining after an
+        # interruption) can be told apart from the current one.
+        self._aggregation_generation: int = 0
 
     def _maybe_add_tool_change_messages(self, new_tools: ToolsSchema | NotGiven) -> None:
         """Append a developer message describing tool add/remove deltas.
@@ -623,6 +627,7 @@ class LLMContextAggregator(FrameProcessor):
     async def reset(self):
         """Reset the aggregation state."""
         self._aggregation = []
+        self._aggregation_generation += 1
 
     @abstractmethod
     async def push_aggregation(self) -> str:
@@ -1928,6 +1933,9 @@ class LLMAssistantAggregator(LLMContextAggregator):
         self._context_push_owed: bool = False
 
         self._assistant_turn_start_timestamp = ""
+        # Inshurik patch 4: the aggregation generation the current LLM response
+        # started in; see `_handle_text`.
+        self._active_llm_generation: int = 0
 
         self._thought_append_to_context = False
         self._thought_llm: str = ""
@@ -2185,7 +2193,14 @@ class LLMAssistantAggregator(LLMContextAggregator):
         if not self._aggregation:
             return ""
 
-        aggregation = self.aggregation_string()
+        # Atomic swap: capture the current buffer and replace it before any
+        # await, so TextFrames from a subsequent LLM response go to a fresh
+        # list. Without the swap, tokens from a new response can interleave
+        # into the old buffer between the read and the clear (inshurik run 1274:
+        # a garbled assistant message led to 8 empty completions, 65 s mute).
+        current_aggregation = self._aggregation
+        self._aggregation = []
+        aggregation = concatenate_aggregated_text(current_aggregation)
         await self.reset()
 
         # The LLM writes its own replies' tags, or a tagger writes them and
@@ -2587,6 +2602,7 @@ class LLMAssistantAggregator(LLMContextAggregator):
             )
 
     async def _handle_llm_start(self, _: LLMFullResponseStartFrame):
+        self._active_llm_generation = self._aggregation_generation
         # Realtime mode treats LLMFullResponseStartFrame as the user
         # turn's end signal for context-writing purposes — see
         # _realtime_handle_llm_start.
@@ -2656,6 +2672,13 @@ class LLMAssistantAggregator(LLMContextAggregator):
             await self._call_event_handler("on_assistant_backchannel", message)
 
         if not frame.append_to_context:
+            return
+
+        # Reject stale tokens from a pre-interruption LLM response whose stream
+        # hasn't fully drained yet. reset() bumps the generation counter; if the
+        # LLM response that started this stream recorded a different
+        # generation, its tokens belong to a cancelled turn (inshurik patch 4).
+        if self._active_llm_generation != self._aggregation_generation:
             return
 
         # The text as the LLM wrote it, which a unit that is only tags has
