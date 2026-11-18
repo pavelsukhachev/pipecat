@@ -77,6 +77,12 @@ class _Stream:
     def __aiter__(self):
         return self
 
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *exc):
+        return False
+
     async def __anext__(self):
         if not self._chunks:
             raise StopAsyncIteration
@@ -102,3 +108,64 @@ async def test_unparseable_tool_arguments_are_logged_by_length():
     assert len(warnings) == 1
     assert "Sarah" not in warnings[0] and "1951" not in warnings[0]
     assert f"({len(broken)} chars)" in warnings[0]
+
+
+def _only_parse_warning(lines: list[str], broken: str) -> str:
+    warnings = [line for line in lines if "Failed to parse function call arguments" in line]
+    assert len(warnings) == 1
+    assert "Sarah" not in warnings[0] and "1951" not in warnings[0]
+    assert f"({len(broken)} chars)" in warnings[0]
+    return warnings[0]
+
+
+@pytest.mark.asyncio
+async def test_sambanova_logs_unparseable_tool_arguments_by_length():
+    from pipecat.services.sambanova.llm import SambaNovaLLMService
+
+    with patch.object(SambaNovaLLMService, "create_client"):
+        llm = SambaNovaLLMService(api_key="test-key")
+    broken = '{"name": "' + _PII
+    llm.get_chat_completions = AsyncMock(
+        return_value=_Stream([_tool_call_chunk("save_applicant", broken)])
+    )
+    llm.push_frame = AsyncMock()
+    llm.run_function_calls = AsyncMock()
+    lines, stop = _capture()
+    try:
+        await llm._process_context(LLMContext())
+    finally:
+        stop()
+    _only_parse_warning(lines, broken)
+
+
+def test_openai_responses_logs_unparseable_tool_arguments_by_length():
+    from pipecat.services.openai.responses.llm import OpenAIResponsesHttpLLMService
+
+    llm = OpenAIResponsesHttpLLMService(api_key="test-key")
+    broken = '{"name": "' + _PII
+    lines, stop = _capture()
+    try:
+        calls = llm._process_function_calls(
+            LLMContext(),
+            {"item_1": {"name": "save_applicant", "call_id": "c1", "arguments": broken}},
+        )
+    finally:
+        stop()
+    _only_parse_warning(lines, broken)
+    assert calls[0].arguments == {}
+
+
+def test_google_interactions_logs_unparseable_tool_arguments_by_length():
+    from pipecat.services.google.interactions.llm import GoogleInteractionsLLMService
+
+    llm = GoogleInteractionsLLMService(api_key="test-key")
+    broken = '{"name": "' + _PII
+    lines, stop = _capture()
+    try:
+        llm._function_call(
+            LLMContext(),
+            {"name": "save_applicant", "id": "c1", "initial": {}, "arguments": broken},
+        )
+    finally:
+        stop()
+    _only_parse_warning(lines, broken)

@@ -72,10 +72,11 @@ class _ConnectRecorder:
         raise AssertionError(f"expected {count} connects, got {len(self.system_instructions)}")
 
 
-def _service(system_instruction: str) -> GeminiLiveLLMService:
+def _service(system_instruction: str, **kwargs) -> GeminiLiveLLMService:
     return GeminiLiveLLMService(
         api_key="test-key",
         settings=GeminiLiveLLMService.Settings(system_instruction=system_instruction),
+        **kwargs,
     )
 
 
@@ -107,8 +108,13 @@ async def _running(service: GeminiLiveLLMService, recorder: _ConnectRecorder):
 
 @pytest.mark.asyncio
 async def test_first_context_reconnects_with_composed_instruction():
-    """Async-tool guidance composed at start reaches the model on the first context."""
-    service = _service("base prompt")
+    """Async-tool guidance composed at start reaches the model on the first context.
+
+    Inshurik: the guidance is composed in only with ``enable_async_tool_cancellation``
+    (tests/test_inshurik_lucy603_parity.py), so this test opts in.
+    """
+    with pytest.warns(DeprecationWarning):
+        service = _service("base prompt", enable_async_tool_cancellation=True)
     service.register_function("check_order", AsyncMock(), cancel_on_interruption=False)
     recorder = _ConnectRecorder()
     async with _running(service, recorder):
