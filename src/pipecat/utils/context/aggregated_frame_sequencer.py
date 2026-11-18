@@ -38,6 +38,8 @@ class _AggregatedFrameSlot:
     includes_inter_frame_spaces: bool = False
 
 
+# Log lines here carry ids and character counts, never text: an assistant reply can
+# carry a customer's personal details read back (inshurik LUCY-599 security review).
 class AggregatedFrameSequencer:
     """Sequences AggregatedTextFrame slots to preserve TTS context ordering.
 
@@ -176,7 +178,7 @@ class AggregatedFrameSequencer:
                 )
                 if not word_fits_next:
                     logger.warning(
-                        f"{self._name} Word '{word}' not recognised by any slot, "
+                        f"{self._name} a word ({len(word)} chars) not recognised by any slot, "
                         "emitting as passthrough"
                     )
                     return [
@@ -220,7 +222,9 @@ class AggregatedFrameSequencer:
             active.complete = True
             frames.extend(self.flush(last_word_pts=pts))
             if raw_overflow_word:
-                logger.debug(f"{self._name} Emitting overflow word '{raw_overflow_word}'")
+                logger.debug(
+                    f"{self._name} Emitting an overflow word ({len(raw_overflow_word)} chars)"
+                )
                 frames.extend(self._process_overflow(raw_overflow_word, pts))
 
         return frames
@@ -264,7 +268,10 @@ class AggregatedFrameSequencer:
                 slot.frame.transport_destination = slot.transport_destination
                 if last_word_pts:
                     slot.frame.pts = last_word_pts
-                logger.debug(f"{self._name}: Flushing Aggregated Frame {slot.frame}")
+                logger.debug(
+                    f"{self._name}: Flushing {type(slot.frame).__name__} "
+                    f"context={slot.context_id} ({len(slot.frame.text or '')} chars)"
+                )
                 frames.append(slot.frame)
                 slot.complete = True
                 self._slots.pop(0)
@@ -272,7 +279,7 @@ class AggregatedFrameSequencer:
                 break  # spoken but not yet complete — wait
         return frames
 
-    def force_complete(self, last_word_pts: int) -> list[Frame]:
+    def force_complete(self, last_word_pts: int, *, emit_remaining: bool = True) -> list[Frame]:
         """Force-complete all incomplete spoken slots and flush skipped frames.
 
         Called at the end of an audio context to handle TTS providers that silently drop
@@ -283,6 +290,9 @@ class AggregatedFrameSequencer:
         Args:
             last_word_pts: PTS of the last received word frame, used as the PTS for
                 force-completed frames and forwarded to :meth:`flush`.
+            emit_remaining: Whether to emit the remaining unspoken text. False when
+                the context produced no audio, so none of its text was spoken: the
+                slots are completed without emitting their text.
 
         Returns:
             Combined list of TTSTextFrames (for incomplete spoken slots) and
@@ -296,14 +306,22 @@ class AggregatedFrameSequencer:
                     raw_remaining = slot.tracker.get_remaining_llm_text()
                     if raw_remaining and remaining_text and remaining_text not in raw_remaining:
                         logger.warning(
-                            f"{self._name} force-complete: raw_remaining {repr(raw_remaining)} "
-                            f"does not contain remaining_text {repr(remaining_text)}, discarding"
+                            f"{self._name} force-complete: context {slot.context_id} raw_remaining "
+                            f"({len(raw_remaining)} chars) does not contain remaining_text "
+                            f"({len(remaining_text)} chars), discarding"
                         )
                         raw_remaining = None
-                    if remaining_text:
+                    if remaining_text and not emit_remaining:
+                        # Metadata only: the text can carry a customer's personal
+                        # details, so it is never logged.
+                        logger.warning(
+                            f"{self._name} context {slot.context_id} produced no audio, "
+                            f"dropping its unspoken text ({len(remaining_text)} chars)"
+                        )
+                    elif remaining_text:
                         logger.debug(
-                            f"{self._name} force-completing slot with remaining text "
-                            f"{repr(remaining_text)}"
+                            f"{self._name} force-completing context {slot.context_id} slot "
+                            f"with remaining text ({len(remaining_text)} chars)"
                         )
                         frames.append(
                             self._build_word_frame(
