@@ -1433,9 +1433,12 @@ class TTSService(AIService):
         # The surrounding bookkeeping still runs, so the turn completes with no
         # audio rather than stalling.
         if not self.is_usable:
-            # Name the text that goes unspoken: silence from the bot is
-            # otherwise hard to trace back to the service that caused it.
-            logger.warning(f"{self}: service is no longer usable, not speaking [{prepared_text}]")
+            # Say that text goes unspoken (its length, never the text: it is
+            # what the bot was about to say): silence from the bot is otherwise
+            # hard to trace back to the service that caused it.
+            logger.warning(
+                f"{self}: service is no longer usable, not speaking ({len(prepared_text)} chars)"
+            )
         else:
             await self.tts_process_generator(context_id, self.run_tts(prepared_text, context_id))
 

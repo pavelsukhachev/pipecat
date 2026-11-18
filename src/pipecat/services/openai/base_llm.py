@@ -688,7 +688,10 @@ class BaseOpenAILLMService(LLMService[OpenAILLMAdapter]):
                 try:
                     arguments = json.loads(arguments)
                 except json.JSONDecodeError:
-                    logger.warning(f"{self}: Failed to parse function call arguments: {arguments}")
+                    logger.warning(
+                        f"{self}: Failed to parse function call arguments "
+                        f"for {function_name} ({len(arguments)} chars)"
+                    )
                     continue
                 function_calls.append(
                     FunctionCallFromLLM(
