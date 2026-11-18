@@ -269,7 +269,9 @@ class SambaNovaLLMService(OpenAILLMService):
                 try:
                     arguments = json.loads(arguments)
                 except json.JSONDecodeError:
-                    logger.warning(f"{self}: Failed to parse function call arguments: {arguments}")
+                    logger.warning(
+                        f"{self}: Failed to parse function call arguments ({len(arguments)} chars)"
+                    )
                     continue
                 function_calls.append(
                     FunctionCallFromLLM(

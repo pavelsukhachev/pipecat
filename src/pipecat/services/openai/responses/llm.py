@@ -545,7 +545,8 @@ class _BaseOpenAIResponsesLLMService(LLMService[OpenAIResponsesLLMAdapter]):
                 arguments = json.loads(fc["arguments"]) if fc["arguments"] else {}
             except json.JSONDecodeError:
                 logger.warning(
-                    f"{self}: Failed to parse function call arguments: {fc['arguments']}"
+                    f"{self}: Failed to parse function call arguments "
+                    f"({len(fc['arguments'])} chars)"
                 )
                 arguments = {}
             fc_list.append(

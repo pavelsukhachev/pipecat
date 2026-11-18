@@ -942,10 +942,20 @@ class GrokRealtimeLLMService(LLMService[GrokRealtimeLLMAdapter]):
                     or "already has an active response" in msg
                     or "truncat" in msg
                 ):
-                    logger.debug(f"{self} {evt.error.message}")
+                    await self._handle_evt_tolerated_error(evt)
                 else:
                     await self._handle_evt_error(evt)
                     return
+
+    async def _handle_evt_tolerated_error(self, evt):
+        """Handle an ``error`` the receive loop tolerates and keeps reading after.
+
+        These are the cancel and truncate races matched above (no active
+        response, already an active response, truncation). The loop does not
+        exit for them. Subclasses that keep their own response state override
+        this hook to resync it; the default only logs (inshurik LUCY-603).
+        """
+        logger.debug(f"{self} {evt.error.message}")
 
     async def _handle_evt_session_created(self, evt):
         """Record the server session snapshot; config is sent on conversation.created."""

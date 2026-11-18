@@ -16,6 +16,15 @@ class EndTaskReason(Enum):
     UNEXPECTED_ERROR = "unexpected_error"
     TRANSFER_CALL = "transfer_call"
     PIPELINE_ERROR = "pipeline_error"
+    # Inshurik (LUCY-603): members dograh dropped after pipecat 1.3. The voice
+    # app ends calls with them and its reports, callbacks and dispositions match
+    # on the persisted strings ("end_call_tool", "user_qualified", ...), so the
+    # values must not change.
+    END_CALL_TOOL_REASON = "end_call_tool"
+    USER_QUALIFIED = "user_qualified"
+    USER_DISQUALIFIED = "user_disqualified"
+    SYSTEM_CONNECT_ERROR = "system_connect_error"
+    UNKNOWN = "unknown"
 
 
 class RealtimeFeedbackType(Enum):

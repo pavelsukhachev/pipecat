@@ -284,6 +284,37 @@ class TestEmptyUserTurnIdle(unittest.IsolatedAsyncioTestCase):
         # The recovery response is on its way, so the user isn't idle yet.
         self.assertFalse(await self._idle_fired([*_bot_speaking(), *_empty_turn()]))
 
+    async def test_idle_timer_rearmed_after_bargein_in_realtime_mode(self):
+        # Inshurik patch 6. In realtime-service mode the user aggregator returns
+        # from the turn-stop handler before the empty-turn path that calls
+        # `wait_for_user()`, so the idle controller itself must restart the
+        # timer when a barge-in that interrupted the bot ends with the bot quiet.
+        context = LLMContext()
+        user, assistant = LLMContextAggregatorPair(
+            context,
+            user_params=_user_params(user_idle_timeout=0.2),
+            realtime_service_mode=True,
+        )
+        idle = False
+
+        @user.event_handler("on_user_turn_idle")
+        async def on_user_turn_idle(aggregator):
+            nonlocal idle
+            idle = True
+
+        await run_test(
+            Pipeline([user, assistant]),
+            frames_to_send=[
+                *_bot_speaking(),
+                VADUserStartedSpeakingFrame(),
+                BotStoppedSpeakingFrame(),
+                VADUserStoppedSpeakingFrame(),
+                SleepFrame(sleep=USER_TURN_STOP_TIMEOUT + 0.2),
+                SleepFrame(0.4),
+            ],
+        )
+        self.assertTrue(idle)
+
 
 class TestEmptyUserTurnRealtime(unittest.IsolatedAsyncioTestCase):
     async def test_disabled_in_explicit_realtime_mode(self):

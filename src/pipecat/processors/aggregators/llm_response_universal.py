@@ -485,6 +485,10 @@ class LLMContextAggregator(FrameProcessor):
         self._add_tool_change_messages = add_tool_change_messages
 
         self._aggregation: list[TextPartForConcatenation] = []
+        # Inshurik patch 4: bumped on every reset() so text from a response that
+        # started before the reset (a stream still draining after an
+        # interruption) can be told apart from the current one.
+        self._aggregation_generation: int = 0
 
     def _maybe_add_tool_change_messages(self, new_tools: ToolsSchema | NotGiven) -> None:
         """Append a developer message describing tool add/remove deltas.
@@ -623,6 +627,7 @@ class LLMContextAggregator(FrameProcessor):
     async def reset(self):
         """Reset the aggregation state."""
         self._aggregation = []
+        self._aggregation_generation += 1
 
     @abstractmethod
     async def push_aggregation(self) -> str:
@@ -716,6 +721,7 @@ class LLMUserAggregator(LLMContextAggregator):
         *,
         params: LLMUserAggregatorParams | None = None,
         _realtime_service_mode: bool | None = None,
+        _keep_muted_realtime_transcriptions: bool | None = None,
         **kwargs,
     ):
         """Initialize the user context aggregator.
@@ -727,6 +733,9 @@ class LLMUserAggregator(LLMContextAggregator):
                 propagated from ``LLMContextAggregatorPair`` (``None`` =
                 auto-configure from service metadata). Not intended for
                 direct use — construct the aggregators via the pair.
+            _keep_muted_realtime_transcriptions: Pair-internal (inshurik).
+                Keep a ``TranscriptionFrame`` that arrives while the user is
+                muted, without realtime mode's other context-write changes.
             **kwargs: Additional arguments.
         """
         params = params or LLMUserAggregatorParams()
@@ -753,6 +762,9 @@ class LLMUserAggregator(LLMContextAggregator):
         # itself, at which point _handle_llm_service_metadata flips this to True.
         # Explicit True/False force the mode on or off (legacy context writes).
         self._realtime_service_mode = _realtime_service_mode
+        # Inshurik (LUCY-598): the narrow muted-transcript keep, usable with
+        # realtime_service_mode=False (legacy context writes). See process_frame.
+        self._keep_muted_realtime_transcriptions = bool(_keep_muted_realtime_transcriptions)
 
         user_turn_strategies = self._params.user_turn_strategies or UserTurnStrategies()
 
@@ -932,8 +944,12 @@ class LLMUserAggregator(LLMContextAggregator):
             # A realtime service transcribes audio it has already heard, and
             # often delivers the transcript after its reply starts, when the
             # user may be muted. Keep the text for the context; turn-taking
-            # stays muted.
-            if self._realtime_service_mode and isinstance(frame, TranscriptionFrame):
+            # stays muted (the turn strategies never see it). Inshurik
+            # (LUCY-598): also with keep_muted_realtime_transcriptions, the
+            # narrow keep that leaves realtime mode's other writes off.
+            if (
+                self._realtime_service_mode or self._keep_muted_realtime_transcriptions
+            ) and isinstance(frame, TranscriptionFrame):
                 self._handle_perception(frame.perception)
                 await self._handle_transcription(frame)
             return
@@ -1928,6 +1944,12 @@ class LLMAssistantAggregator(LLMContextAggregator):
         self._context_push_owed: bool = False
 
         self._assistant_turn_start_timestamp = ""
+        # Inshurik patch 4: the aggregation generation the current LLM response
+        # started in; see `_handle_text`.
+        self._active_llm_generation: int = 0
+        # The generation an interruption's reset() left behind, until the next
+        # LLM response starts: text in it may come from a stream still draining.
+        self._interrupted_generation: int | None = None
 
         self._thought_append_to_context = False
         self._thought_llm: str = ""
@@ -2185,7 +2207,14 @@ class LLMAssistantAggregator(LLMContextAggregator):
         if not self._aggregation:
             return ""
 
-        aggregation = self.aggregation_string()
+        # Atomic swap: capture the current buffer and replace it before any
+        # await, so TextFrames from a subsequent LLM response go to a fresh
+        # list. Without the swap, tokens from a new response can interleave
+        # into the old buffer between the read and the clear (inshurik run 1274:
+        # a garbled assistant message led to 8 empty completions, 65 s mute).
+        current_aggregation = self._aggregation
+        self._aggregation = []
+        aggregation = concatenate_aggregated_text(current_aggregation)
         await self.reset()
 
         # The LLM writes its own replies' tags, or a tagger writes them and
@@ -2251,6 +2280,7 @@ class LLMAssistantAggregator(LLMContextAggregator):
     async def _handle_interruptions(self, frame: InterruptionFrame):
         await self._trigger_assistant_turn_stopped(interrupted=True)
         await self.reset()
+        self._interrupted_generation = self._aggregation_generation
 
     async def _handle_end_or_cancel(self, frame: Frame):
         await self._trigger_assistant_turn_stopped(interrupted=isinstance(frame, CancelFrame))
@@ -2449,7 +2479,16 @@ class LLMAssistantAggregator(LLMContextAggregator):
         triggers LLM inference when appropriate.
         """
         deferred = self._is_deferred(in_progress_frame)
-        del self._function_calls_in_progress[frame.tool_call_id]
+        # `pop(..., None)` instead of `del [...]` to absorb the race where the
+        # entry was already removed between the membership check at the caller
+        # (`_handle_function_call_result`) and this point. The `await` before
+        # this call yields the event loop, and any concurrent task that touches
+        # the same `tool_call_id` (double-final FunctionCallResultFrame,
+        # interruption-driven cleanup, cancel handler in parallel) can remove the
+        # entry first, making a `del` here raise KeyError. Symptom in production:
+        # ErrorFrame "Error processing frame: 'call_<id>'" with fatal=False
+        # (5/day Inshurik prod 2026-05-07 → 2026-05-22).
+        self._function_calls_in_progress.pop(frame.tool_call_id, None)
 
         result = (
             json.dumps(frame.result, ensure_ascii=False)
@@ -2487,7 +2526,9 @@ class LLMAssistantAggregator(LLMContextAggregator):
             )
 
         group_id = function_call.group_id
-        del self._function_calls_in_progress[frame.tool_call_id]
+        # `pop(..., None)` — symmetric with `_handle_function_call_finished`,
+        # absorbs the race where a concurrent handler beat us to the removal.
+        self._function_calls_in_progress.pop(frame.tool_call_id, None)
 
         if not frame.run_llm or self._user_speaking:
             return
@@ -2576,6 +2617,8 @@ class LLMAssistantAggregator(LLMContextAggregator):
             )
 
     async def _handle_llm_start(self, _: LLMFullResponseStartFrame):
+        self._active_llm_generation = self._aggregation_generation
+        self._interrupted_generation = None
         # Realtime mode treats LLMFullResponseStartFrame as the user
         # turn's end signal for context-writing purposes — see
         # _realtime_handle_llm_start.
@@ -2613,6 +2656,12 @@ class LLMAssistantAggregator(LLMContextAggregator):
         # utterances that have no surrounding LLM response frames to signal assistant
         # turn boundaries, while rightly deferring to any earlier LLM-driven turn start.
         if frame.append_to_context and not self._assistant_turn_start_timestamp:
+            # Inshurik patch 4: a TTSSpeakFrame utterance has no
+            # LLMFullResponseStartFrame, so its text is taken in the current
+            # generation here. Not straight after an interruption, where the
+            # TTSStartedFrame may belong to a stream that is still draining.
+            if self._aggregation_generation != self._interrupted_generation:
+                self._active_llm_generation = self._aggregation_generation
             await self._trigger_assistant_turn_started()
 
     async def _handle_push_aggregation(self):
@@ -2645,6 +2694,13 @@ class LLMAssistantAggregator(LLMContextAggregator):
             await self._call_event_handler("on_assistant_backchannel", message)
 
         if not frame.append_to_context:
+            return
+
+        # Reject stale tokens from a pre-interruption LLM response whose stream
+        # hasn't fully drained yet. reset() bumps the generation counter; if the
+        # LLM response that started this stream recorded a different
+        # generation, its tokens belong to a cancelled turn (inshurik patch 4).
+        if self._active_llm_generation != self._aggregation_generation:
             return
 
         # The text as the LLM wrote it, which a unit that is only tags has
@@ -2898,6 +2954,7 @@ class LLMContextAggregatorPair:
         assistant_params: LLMAssistantAggregatorParams | None = None,
         add_tool_change_messages: bool | None = None,
         realtime_service_mode: bool | None = None,
+        keep_muted_realtime_transcriptions: bool | None = None,
     ):
         """Initialize the LLM context aggregator pair.
 
@@ -2925,6 +2982,14 @@ class LLMContextAggregatorPair:
                 stays off otherwise. ``True`` / ``False`` force it on or off
                 (``False`` keeps legacy pre-realtime context-write behavior).
                 Both halves share this setting.
+            keep_muted_realtime_transcriptions: Inshurik fork only (LUCY-598).
+                Keep a ``TranscriptionFrame`` that arrives while the user is
+                muted: it is added to the aggregation without reaching the user
+                turn strategies (no turn start/stop, no interruption), and is
+                committed with the next user turn or at session end. Realtime
+                mode does this too; this flag does ONLY this, so it can be used
+                with ``realtime_service_mode=False`` (the 1.3-fork meaning of
+                inshurik's ``realtime_service_mode`` flag).
         """
         user_params = user_params or LLMUserAggregatorParams()
         assistant_params = assistant_params or LLMAssistantAggregatorParams()
@@ -2936,6 +3001,7 @@ class LLMContextAggregatorPair:
             context,
             params=user_params,
             _realtime_service_mode=realtime_service_mode,
+            _keep_muted_realtime_transcriptions=keep_muted_realtime_transcriptions,
         )
         # Wire the assistant→user back-reference unconditionally: realtime mode
         # may be auto-configured later (realtime_service_mode=None), so the
