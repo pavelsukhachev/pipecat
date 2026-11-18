@@ -486,3 +486,40 @@ def test_every_mapped_language_is_accepted_by_some_model():
         code = language_to_elevenlabs_language(language)
         if code in ELEVENLABS_V3_LANGUAGES:
             assert elevenlabs_language_code("eleven_v3", code) == code
+
+
+# ---------------------------------------------------------------------------
+# voice_settings once per connection (inshurik)
+#
+# ElevenLabs accepts voice_settings only in a connection's first message and
+# rejects a re-send, even with identical values, with a 1008 policy violation.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_voice_settings_only_in_the_first_context_init_of_a_connection():
+    service = _make_service()
+    service._voice_settings = service._set_voice_settings()
+    ws = _FakeWebSocket()
+    service._websocket = ws
+
+    await service._send_context_init("ctx-1")
+    await service._send_context_init("ctx-2")
+
+    assert "voice_settings" in ws.sent[0]
+    assert "voice_settings" not in ws.sent[1]
+    assert ws.sent[1]["context_id"] == "ctx-2"
+
+
+@pytest.mark.asyncio
+async def test_voice_settings_sent_again_on_a_new_connection():
+    service = _make_service()
+    service._voice_settings = service._set_voice_settings()
+    ws = _FakeWebSocket()
+    service._websocket = ws
+    await service._send_context_init("ctx-1")
+
+    service._clear_connection_state()  # what _disconnect does when the socket closes
+    await service._send_context_init("ctx-2")
+
+    assert "voice_settings" in ws.sent[1]
