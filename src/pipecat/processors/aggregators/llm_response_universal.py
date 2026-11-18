@@ -2449,7 +2449,16 @@ class LLMAssistantAggregator(LLMContextAggregator):
         triggers LLM inference when appropriate.
         """
         deferred = self._is_deferred(in_progress_frame)
-        del self._function_calls_in_progress[frame.tool_call_id]
+        # `pop(..., None)` instead of `del [...]` to absorb the race where the
+        # entry was already removed between the membership check at the caller
+        # (`_handle_function_call_result`) and this point. The `await` before
+        # this call yields the event loop, and any concurrent task that touches
+        # the same `tool_call_id` (double-final FunctionCallResultFrame,
+        # interruption-driven cleanup, cancel handler in parallel) can remove the
+        # entry first, making a `del` here raise KeyError. Symptom in production:
+        # ErrorFrame "Error processing frame: 'call_<id>'" with fatal=False
+        # (5/day Inshurik prod 2026-05-07 → 2026-05-22).
+        self._function_calls_in_progress.pop(frame.tool_call_id, None)
 
         result = (
             json.dumps(frame.result, ensure_ascii=False)
@@ -2487,7 +2496,9 @@ class LLMAssistantAggregator(LLMContextAggregator):
             )
 
         group_id = function_call.group_id
-        del self._function_calls_in_progress[frame.tool_call_id]
+        # `pop(..., None)` — symmetric with `_handle_function_call_finished`,
+        # absorbs the race where a concurrent handler beat us to the removal.
+        self._function_calls_in_progress.pop(frame.tool_call_id, None)
 
         if not frame.run_llm or self._user_speaking:
             return
