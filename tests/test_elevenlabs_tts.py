@@ -871,3 +871,30 @@ async def test_voice_settings_sent_again_on_a_new_connection():
     await service._send_context_init("ctx-2")
 
     assert "voice_settings" in ws.sent[1]
+
+
+@pytest.mark.asyncio
+async def test_voice_settings_change_reconnects_once_settings_were_sent():
+    """New voice_settings can only ride on a fresh connection's first message."""
+    service = _make_service()
+    service._connection_voice_settings_sent = True
+    with (
+        unittest.mock.patch.object(service, "_disconnect") as disconnect,
+        unittest.mock.patch.object(service, "_connect") as connect,
+    ):
+        await service._update_settings(ElevenLabsTTSService.Settings(stability=0.3))
+    disconnect.assert_awaited_once()
+    connect.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_voice_settings_change_before_any_were_sent_keeps_the_connection():
+    """The next context init carries the new values, so no reconnect is needed."""
+    service = _make_service()
+    with (
+        unittest.mock.patch.object(service, "_disconnect") as disconnect,
+        unittest.mock.patch.object(service, "_connect") as connect,
+    ):
+        await service._update_settings(ElevenLabsTTSService.Settings(stability=0.3))
+    disconnect.assert_not_awaited()
+    connect.assert_not_awaited()
