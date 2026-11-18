@@ -11,7 +11,9 @@ format conversion, volume calculation, and codec transformations for
 various audio formats used in Pipecat pipelines.
 """
 
+import contextvars
 import io
+import warnings
 import wave
 
 import loudness
@@ -27,6 +29,75 @@ from pipecat.utils.deprecation import deprecated
 SPEAKING_THRESHOLD = 20
 
 
+#: Resampler families :func:`create_file_resampler` and :func:`create_stream_resampler`
+#: can build (Inshurik fork). ``"sinc"`` is upstream's default since 1.16; ``"soxr"`` is
+#: the SoX family every release before 1.16 used, kept selectable so an application can
+#: move to sinc deliberately rather than as a side effect of an upgrade.
+RESAMPLER_FAMILIES = ("sinc", "soxr")
+
+_default_resampler_family = "sinc"
+_resampler_family: contextvars.ContextVar[str | None] = contextvars.ContextVar(
+    "pipecat_resampler_family", default=None
+)
+
+
+def _checked_family(family: str) -> str:
+    if family not in RESAMPLER_FAMILIES:
+        raise ValueError(
+            f"Unknown resampler family {family!r}; expected one of {RESAMPLER_FAMILIES}"
+        )
+    return family
+
+
+def set_default_resampler_family(family: str) -> None:
+    """Set the resampler family for the whole process (Inshurik fork).
+
+    Args:
+        family: ``"sinc"`` (upstream's default) or ``"soxr"``.
+    """
+    global _default_resampler_family
+    _default_resampler_family = _checked_family(family)
+
+
+def use_resampler_family(family: str | None) -> contextvars.Token:
+    """Use ``family`` in this task and every task it starts from here on (Inshurik fork).
+
+    ``None`` falls back to the process default. Resamplers built before the
+    call keep the family they were built with.
+
+    Args:
+        family: ``"sinc"``, ``"soxr"`` or ``None``.
+
+    Returns:
+        A token for :func:`reset_resampler_family`.
+    """
+    return _resampler_family.set(None if family is None else _checked_family(family))
+
+
+def reset_resampler_family(token: contextvars.Token) -> None:
+    """Undo a :func:`use_resampler_family` (Inshurik fork)."""
+    _resampler_family.reset(token)
+
+
+def resampler_family() -> str:
+    """The family the resampler factories build here: the task's choice, else the process default."""
+    return _resampler_family.get() or _default_resampler_family
+
+
+def _soxr_resampler(stream: bool, **kwargs) -> BaseAudioResampler:
+    # Chosen on purpose, so the 1.16 deprecation warning is not news to the caller. A
+    # missing soxr package raises ImportError here: never a quiet switch to sinc.
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", DeprecationWarning)
+        if stream:
+            from pipecat.audio.resamplers.soxr_stream_resampler import SOXRStreamAudioResampler
+
+            return SOXRStreamAudioResampler(**kwargs)
+        from pipecat.audio.resamplers.soxr_resampler import SOXRAudioResampler
+
+        return SOXRAudioResampler(**kwargs)
+
+
 def create_file_resampler(**kwargs) -> BaseAudioResampler:
     """Create an audio resampler instance for batch processing of complete audio files.
 
@@ -36,8 +107,11 @@ def create_file_resampler(**kwargs) -> BaseAudioResampler:
         **kwargs: Additional keyword arguments passed to the resampler constructor.
 
     Returns:
-        A configured SincAudioResampler instance.
+        A SincAudioResampler, or a SOXRAudioResampler when the resampler family
+        is ``"soxr"`` (see :func:`resampler_family`).
     """
+    if resampler_family() == "soxr":
+        return _soxr_resampler(stream=False, **kwargs)
     return SincAudioResampler(**kwargs)
 
 
@@ -51,8 +125,11 @@ def create_stream_resampler(**kwargs) -> BaseAudioResampler:
         **kwargs: Additional keyword arguments passed to the resampler constructor.
 
     Returns:
-        A configured SincStreamAudioResampler instance.
+        A SincStreamAudioResampler, or a SOXRStreamAudioResampler when the
+        resampler family is ``"soxr"`` (see :func:`resampler_family`).
     """
+    if resampler_family() == "soxr":
+        return _soxr_resampler(stream=True, **kwargs)
     return SincStreamAudioResampler(**kwargs)
 
 
