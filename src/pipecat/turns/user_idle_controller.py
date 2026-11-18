@@ -159,6 +159,21 @@ class UserIdleController(BaseObject):
             await self._cancel_idle_timer()
         elif isinstance(frame, UserStoppedSpeakingFrame):
             self._user_turn_in_progress = False
+            # Inshurik patch 6: restart the idle timer when the user's turn ends
+            # and the bot is not speaking. This covers a *filtered* barge-in: a
+            # short utterance ("yes"/"okay") during bot speech that never becomes
+            # a turn the LLM answers. Its UserStoppedSpeaking arrives AFTER
+            # BotStoppedSpeaking, so the BotStopped branch above saw the turn in
+            # progress and skipped the timer. Upstream re-arms via
+            # `wait_for_user()` from the user aggregator's empty-turn path, but
+            # that path returns early in realtime-service mode (Lucy's Grok
+            # engine), so without this the bot can sit silent for minutes
+            # (inshurik voice #61). `_waiting_for_user` is deliberately left
+            # alone: a normal turn's UserStopped also lands here before the bot
+            # answers, and that window must still count as "bot busy" for the
+            # interruption bookkeeping.
+            if not self._bot_speaking and self._function_calls_in_progress == 0:
+                await self._start_idle_timer()
         elif isinstance(frame, FunctionCallsStartedFrame):
             self._waiting_for_user = False
             self._function_calls_in_progress += len(frame.function_calls)
