@@ -1427,7 +1427,11 @@ class TestAsyncToolCancellationExposure(unittest.IsolatedAsyncioTestCase):
 
 
 class TestAsyncToolInstructions(unittest.IsolatedAsyncioTestCase):
-    """The async-tool guidance follows the registry, however a tool got there."""
+    """The async-tool guidance follows the registry, however a tool got there.
+
+    Inshurik: only with ``enable_async_tool_cancellation``; without it an async
+    tool leaves the system instruction as given (LUCY-603).
+    """
 
     @staticmethod
     async def _handler(params):
@@ -1436,8 +1440,18 @@ class TestAsyncToolInstructions(unittest.IsolatedAsyncioTestCase):
     def _composed(self, service) -> str:
         return service._settings.system_instruction or ""
 
-    def test_manual_async_registration(self):
+    def _service_with_cancellation(self):
+        with self.assertWarns(DeprecationWarning):
+            return MockLLMService(system_instruction="BASE", enable_async_tool_cancellation=True)
+
+    def test_absent_without_async_tool_cancellation(self):
         service = MockLLMService(system_instruction="BASE")
+        service.register_function("weather", self._handler, cancel_on_interruption=False)
+        service._sync_registered_tool_handlers(NOT_GIVEN)
+        self.assertEqual(self._composed(service), "BASE")
+
+    def test_manual_async_registration(self):
+        service = self._service_with_cancellation()
         service.register_function("weather", self._handler, cancel_on_interruption=False)
         # A manual registration never goes through the advertised-tool path, and a
         # context can advertise nothing at all; the sync still settles the registry.
@@ -1445,7 +1459,7 @@ class TestAsyncToolInstructions(unittest.IsolatedAsyncioTestCase):
         self.assertIn("ASYNC TOOLS:", self._composed(service))
 
     def test_advertised_async_tool(self):
-        service = MockLLMService(system_instruction="BASE")
+        service = self._service_with_cancellation()
         service.register_function("weather", self._handler, cancel_on_interruption=False)
         service._sync_registered_tool_handlers(LLMContext(tools=NOT_GIVEN).tools)
         self.assertIn("ASYNC TOOLS:", self._composed(service))
