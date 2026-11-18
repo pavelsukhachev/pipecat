@@ -161,9 +161,12 @@ class TestTTSStatusGating(unittest.IsolatedAsyncioTestCase):
         finally:
             logger.remove(handler_id)
 
-        warning = next((m for m in messages if "this should be spoken" in m), None)
+        # Inshurik: the warning names the line's length, never the line — it is
+        # what the bot was about to say (tests/test_inshurik_pii_free_logs.py).
+        warning = next((m for m in messages if "no longer usable" in m), None)
         self.assertIsNotNone(warning, f"dropped text was not reported: {messages}")
-        self.assertIn("no longer usable", warning)
+        self.assertIn(f"({len('this should be spoken')} chars)", warning)
+        self.assertNotIn("this should be spoken", warning)
 
 
 class TestApplicationErrorClassification(unittest.IsolatedAsyncioTestCase):

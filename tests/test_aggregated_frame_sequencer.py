@@ -2370,5 +2370,91 @@ class TestUnmatchedSymbolDoesNotDesyncTheTurn(unittest.IsolatedAsyncioTestCase):
         )
 
 
+# ---------------------------------------------------------------------------
+# inshurik LUCY-599: a context without audio emits none of its text, and logs
+# carry ids and character counts, never the reply's text
+# ---------------------------------------------------------------------------
+
+# Stand-ins for a customer's details read back: a date of birth and account digits.
+_DOB = "04171951"
+_ACCT = "662300"
+
+
+class TestInshurikNoAudioAndLogs(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        from loguru import logger
+
+        self._logger = logger
+        self.records = []
+        self._sink = logger.add(
+            lambda m: self.records.append(m.record), level=0, format="{message}"
+        )
+
+    def tearDown(self):
+        self._logger.remove(self._sink)
+
+    def assertNoText(self, *fragments):
+        messages = [r["message"] for r in self.records]
+        self.assertTrue(messages, "the path under test logged nothing")
+        for fragment in fragments:
+            self.assertFalse(any(fragment in m for m in messages), fragment)
+
+    async def test_drops_remaining_text_without_audio(self):
+        seq = _seq()
+        await seq.register_spoken(_spoken_frame("hello world"), "ctx1", "hello world", True)
+
+        result = seq.force_complete("ctx1", last_word_pts=0, emit_remaining=False)
+
+        self.assertEqual([f for f in result if isinstance(f, TTSTextFrame)], [])
+        self.assertTrue(
+            any(r["level"].name == "WARNING" and "(11 chars)" in r["message"] for r in self.records)
+        )
+        self.assertNoText("hello", "world")
+
+    async def test_flushes_skipped_frames_without_audio(self):
+        seq = _seq()
+        await seq.register_spoken(_spoken_frame("hello"), "ctx1", "hello", True)
+        skipped = _skipped_frame("code")
+        await seq.register_skipped(skipped, "ctx2", None)
+
+        result = seq.force_complete("ctx1", last_word_pts=20, emit_remaining=False)
+
+        self.assertIn(skipped, result)
+        self.assertEqual([f for f in result if isinstance(f, TTSTextFrame)], [])
+
+    async def test_force_complete_mismatch_warning(self):
+        seq = _seq()
+        await seq.register_spoken(_spoken_frame(_DOB, raw_text=_ACCT), "ctx1", _DOB, True)
+        seq.force_complete("ctx1", last_word_pts=0)
+        self.assertTrue(any("does not contain" in r["message"] for r in self.records))
+        self.assertNoText(_DOB, _ACCT)
+
+    async def test_force_complete_debug(self):
+        seq = _seq()
+        await seq.register_spoken(_spoken_frame(_DOB), "ctx1", _DOB, True)
+        seq.force_complete("ctx1", last_word_pts=0)
+        self.assertTrue(any("force-completing" in r["message"] for r in self.records))
+        self.assertNoText(_DOB)
+
+    async def test_unrecognised_word_warning(self):
+        seq = _seq()
+        await seq.register_spoken(_spoken_frame("hello world"), "ctx1", "hello world", True)
+        seq.process_word(_DOB, pts=5, context_id="ctx1")
+        self.assertNoText(_DOB)
+
+    async def test_stale_word_debug(self):
+        seq = _seq()
+        seq.process_word(_DOB, pts=5, context_id="gone")
+        self.assertNoText(_DOB)
+
+    async def test_flushing_a_skipped_frame_debug(self):
+        seq = _seq()
+        await seq.register_spoken(_spoken_frame("hello"), "ctx1", "hello", True)
+        await seq.register_skipped(_skipped_frame(_ACCT), "ctx2", None)
+        seq.force_complete("ctx1", last_word_pts=0)
+        self.assertTrue(any("Flushing" in r["message"] for r in self.records))
+        self.assertNoText(_ACCT)
+
+
 if __name__ == "__main__":
     unittest.main()

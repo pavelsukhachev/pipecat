@@ -671,19 +671,26 @@ class ConversationItemInputAudioTranscriptionUpdated(ServerEvent):
 
 
 class ConversationItemInputAudioTranscriptionCompleted(ServerEvent):
-    """Event indicating input audio transcription is complete.
+    """Input audio transcript snapshot, which may still be in progress.
+
+    Grok sends several of these for one item: cumulative provisional readings
+    marked ``status="in_progress"``, then the final one marked
+    ``status="completed"`` (ported from dograh-hq/pipecat cb766496).
 
     Parameters:
         type: Event type, always "conversation.item.input_audio_transcription.completed".
         item_id: ID of the conversation item that was transcribed.
         content_index: Index of the content within the item, if provided.
-        transcript: Complete transcription text.
+        transcript: Cumulative transcription text.
+        status: ``in_progress`` for provisional text or ``completed`` for the
+            final transcript. Older events omit this field and are final.
     """
 
     type: Literal["conversation.item.input_audio_transcription.completed"]
     item_id: str
     content_index: int | None = None
     transcript: str
+    status: str | None = None
 
 
 class InputAudioBufferSpeechStarted(ServerEvent):

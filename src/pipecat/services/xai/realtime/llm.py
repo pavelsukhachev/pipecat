@@ -821,10 +821,20 @@ class GrokRealtimeLLMService(LLMService[GrokRealtimeLLMAdapter]):
                     or "already has an active response" in msg
                     or "truncat" in msg
                 ):
-                    logger.debug(f"{self} {evt.error.message}")
+                    await self._handle_evt_tolerated_error(evt)
                 else:
                     await self._handle_evt_error(evt)
                     return
+
+    async def _handle_evt_tolerated_error(self, evt):
+        """Handle an ``error`` the receive loop tolerates and keeps reading after.
+
+        These are the cancel and truncate races matched above (no active
+        response, already an active response, truncation). The loop does not
+        exit for them. Subclasses that keep their own response state override
+        this hook to resync it; the default only logs (inshurik LUCY-603).
+        """
+        logger.debug(f"{self} {evt.error.message}")
 
     async def _handle_evt_session_created(self, evt):
         """Record the server session snapshot; config is sent on conversation.created."""
@@ -946,6 +956,12 @@ class GrokRealtimeLLMService(LLMService[GrokRealtimeLLMAdapter]):
 
     async def _handle_evt_input_audio_transcription_completed(self, evt):
         """Handle input audio transcription completed event."""
+        # Grok also sends cumulative provisional text under the completed event
+        # name. Only the final snapshot belongs in the user's conversation turn.
+        if getattr(evt, "status", None) == "in_progress":
+            await self._handle_evt_input_audio_transcription_updated(evt)
+            return
+
         await self._call_event_handler("on_conversation_item_updated", evt.item_id, None)
 
         # Only push transcription if we have actual text (not empty or just whitespace)

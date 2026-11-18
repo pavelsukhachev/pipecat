@@ -103,6 +103,15 @@ IDLE_TIMEOUT_SECS = 300
 
 CANCEL_TIMEOUT_SECS = 20.0
 
+# Inshurik patch 11a: how long a graceful close (EndFrame/StopFrame) may wait
+# for the frame to traverse the pipeline before escalating to a hard cancel.
+# Without this bound a single blocked processor (a dead telephony websocket, a
+# wedged LLM service) parks `run()` forever: its `finally` never runs,
+# `_cancel_tasks()` never fires, and the heartbeat monitor whines every 10s as
+# a zombie. 21 of them accumulated on 2026-08-26 and poisoned shared clients
+# (inshurik voice#200). Upstream deliberately leaves this wait unbounded.
+END_TIMEOUT_SECS = 30.0
+
 SETUP_TIMEOUT_SECS = 20.0
 
 START_TIMEOUT_SECS = 20.0
@@ -282,6 +291,7 @@ class PipelineWorker(BaseWorker):
         cancel_on_idle_timeout: bool = True,
         cancel_runner_on_idle_timeout: bool = True,
         cancel_timeout_secs: float = CANCEL_TIMEOUT_SECS,
+        end_timeout_secs: float | None = END_TIMEOUT_SECS,
         check_dangling_tasks: bool = True,
         clock: BaseClock | None = None,
         conversation_id: str | None = None,
@@ -359,6 +369,9 @@ class PipelineWorker(BaseWorker):
                 peers.
             cancel_timeout_secs: Timeout (in seconds) to wait for cancellation to happen
                 cleanly.
+            end_timeout_secs: How long (in seconds) a graceful close may wait for
+                its EndFrame/StopFrame to reach the end of the pipeline before the
+                worker escalates to a cancel. ``None`` waits without a bound.
             check_dangling_tasks: Whether to warn about tasks left running when
                 the worker finishes. Only applies when the worker owns its task
                 manager; otherwise the runner reports dangling tasks.
@@ -438,6 +451,7 @@ class PipelineWorker(BaseWorker):
         self._cancel_on_idle_timeout = cancel_on_idle_timeout
         self._cancel_runner_on_idle_timeout = cancel_runner_on_idle_timeout
         self._cancel_timeout_secs = cancel_timeout_secs
+        self._end_timeout_secs = end_timeout_secs
         # Frames that have reached the sink. A flush watches this to tell a
         # pipeline that is still working from one that is stuck.
         self._frames_reaching_sink: int = 0
@@ -1256,10 +1270,34 @@ class PipelineWorker(BaseWorker):
             await wait_for_cancel()
         else:
             # Ending flushes what is queued, so cutting the wait short would
-            # drop the audio the EndFrame exists to play out. A processor that
-            # could hold it up watches for that itself.
-            await self._pipeline_end_event.wait()
-            logger.debug(f"{self}: {frame} reached the end of the pipeline, pipeline is closing.")
+            # drop the audio the EndFrame exists to play out. Inshurik bounds
+            # it anyway (patch 11a, voice#200): END_TIMEOUT_SECS is far longer
+            # than any goodbye, and on timeout the close escalates to a hard
+            # cancel, which traverses even where an EndFrame cannot, while
+            # wait_for_cancel's own bounded wait and on_pipeline_finished keep
+            # the event contract. ``end_timeout_secs=None`` restores upstream's
+            # unbounded wait.
+            if self._end_timeout_secs is None:
+                await self._pipeline_end_event.wait()
+                logger.debug(
+                    f"{self}: {frame} reached the end of the pipeline, pipeline is closing."
+                )
+            else:
+                try:
+                    await asyncio.wait_for(
+                        self._pipeline_end_event.wait(), timeout=self._end_timeout_secs
+                    )
+                    logger.debug(
+                        f"{self}: {frame} reached the end of the pipeline, pipeline is closing."
+                    )
+                except TimeoutError:
+                    logger.warning(
+                        f"{self}: {frame} did not reach the end of the pipeline after "
+                        f"{self._end_timeout_secs}s (blocked processor?), escalating to hard cancel"
+                    )
+                    self._cancelled = True
+                    await self._pipeline.queue_frame(CancelFrame(reason="graceful close timed out"))
+                    await wait_for_cancel()
 
         self._pipeline_end_event.clear()
 
