@@ -648,6 +648,7 @@ class LLMUserAggregator(LLMContextAggregator):
         *,
         params: LLMUserAggregatorParams | None = None,
         _realtime_service_mode: bool | None = None,
+        _keep_muted_realtime_transcriptions: bool | None = None,
         **kwargs,
     ):
         """Initialize the user context aggregator.
@@ -659,6 +660,9 @@ class LLMUserAggregator(LLMContextAggregator):
                 propagated from ``LLMContextAggregatorPair`` (``None`` =
                 auto-configure from service metadata). Not intended for
                 direct use — construct the aggregators via the pair.
+            _keep_muted_realtime_transcriptions: Pair-internal (inshurik).
+                Keep a ``TranscriptionFrame`` that arrives while the user is
+                muted, without realtime mode's other context-write changes.
             **kwargs: Additional arguments.
         """
         params = params or LLMUserAggregatorParams()
@@ -684,6 +688,9 @@ class LLMUserAggregator(LLMContextAggregator):
         # itself, at which point _handle_llm_service_metadata flips this to True.
         # Explicit True/False force the mode on or off (legacy context writes).
         self._realtime_service_mode = _realtime_service_mode
+        # Inshurik (LUCY-598): the narrow muted-transcript keep, usable with
+        # realtime_service_mode=False (legacy context writes). See process_frame.
+        self._keep_muted_realtime_transcriptions = bool(_keep_muted_realtime_transcriptions)
 
         user_turn_strategies = self._params.user_turn_strategies or UserTurnStrategies()
 
@@ -836,6 +843,16 @@ class LLMUserAggregator(LLMContextAggregator):
         await super().process_frame(frame, direction)
 
         if await self._maybe_mute_frame(frame):
+            # A realtime service transcribes audio it has already heard, and
+            # often delivers the transcript after its reply starts, when the
+            # user may be muted. Keep the text for the context; turn-taking
+            # stays muted (the turn strategies never see it). Ported from
+            # dograh-hq/pipecat d03e2292 (#84), which is not in 1.12
+            # (inshurik LUCY-598).
+            if (
+                self._realtime_service_mode or self._keep_muted_realtime_transcriptions
+            ) and isinstance(frame, TranscriptionFrame):
+                await self._handle_transcription(frame)
             return
 
         if isinstance(frame, StartFrame):
@@ -2592,6 +2609,7 @@ class LLMContextAggregatorPair:
         assistant_params: LLMAssistantAggregatorParams | None = None,
         add_tool_change_messages: bool | None = None,
         realtime_service_mode: bool | None = None,
+        keep_muted_realtime_transcriptions: bool | None = None,
     ):
         """Initialize the LLM context aggregator pair.
 
@@ -2619,6 +2637,14 @@ class LLMContextAggregatorPair:
                 stays off otherwise. ``True`` / ``False`` force it on or off
                 (``False`` keeps legacy pre-realtime context-write behavior).
                 Both halves share this setting.
+            keep_muted_realtime_transcriptions: Inshurik fork only (LUCY-598).
+                Keep a ``TranscriptionFrame`` that arrives while the user is
+                muted: it is added to the aggregation without reaching the user
+                turn strategies (no turn start/stop, no interruption), and is
+                committed with the next user turn or at session end. Realtime
+                mode does this too; this flag does ONLY this, so it can be used
+                with ``realtime_service_mode=False`` (the 1.3-fork meaning of
+                inshurik's ``realtime_service_mode`` flag).
         """
         user_params = user_params or LLMUserAggregatorParams()
         assistant_params = assistant_params or LLMAssistantAggregatorParams()
@@ -2630,6 +2656,7 @@ class LLMContextAggregatorPair:
             context,
             params=user_params,
             _realtime_service_mode=realtime_service_mode,
+            _keep_muted_realtime_transcriptions=keep_muted_realtime_transcriptions,
         )
         # Wire the assistant→user back-reference unconditionally: realtime mode
         # may be auto-configured later (realtime_service_mode=None), so the
