@@ -190,6 +190,7 @@ class BaseOpenAILLMService(LLMService[OpenAILLMAdapter]):
         settings: Settings | None = None,
         retry_timeout_secs: float | None = 5.0,
         retry_on_timeout: bool | None = False,
+        first_token_timeout_secs: float | None = None,
         **kwargs,
     ):
         """Initialize the BaseOpenAILLMService.
@@ -221,6 +222,14 @@ class BaseOpenAILLMService(LLMService[OpenAILLMAdapter]):
             retry_on_timeout: Whether to re-issue the request once if the first
                 attempt produces no output within ``retry_timeout_secs``. The
                 retry is unbounded.
+            first_token_timeout_secs: Bound on the wait for the FIRST streamed
+                chunk that carries choices. ``retry_timeout_secs`` only bounds
+                ``create()`` (connection and headers: httpx returns on headers
+                for streaming requests), so a completion that connects and then
+                stalls before emitting any token sails through it. When set, a
+                generation whose first choices-bearing chunk has not arrived
+                within this many seconds is torn down and retried ONCE without
+                the bound. None (default) disables the watchdog (inshurik patch 7).
             **kwargs: Additional arguments passed to the parent LLMService.
 
         Raises:
@@ -274,6 +283,7 @@ class BaseOpenAILLMService(LLMService[OpenAILLMAdapter]):
         self._service_tier = service_tier
         self._retry_timeout_secs = retry_timeout_secs
         self._retry_on_timeout = retry_on_timeout
+        self._first_token_timeout_secs = first_token_timeout_secs
         self._full_model_name: str = ""
         self._client = self.create_client(
             api_key=api_key,
@@ -551,24 +561,7 @@ class BaseOpenAILLMService(LLMService[OpenAILLMAdapter]):
 
     @traced_llm
     async def _process_context(self, context: LLMContext):
-        functions_list = []
-        arguments_list = []
-        tool_id_list = []
-        func_idx = 0
-        function_name = ""
-        arguments = ""
-        tool_call_id = ""
-
         response_generation = self._begin_tool_response()
-
-        # Content generated in the current completion, accumulated so the
-        # deferral decision below can ask whether any of it is speakable.
-        generated_content = ""
-
-        await self.start_ttfb_metrics()
-
-        # Generate chat completions from LLMContext
-        chunk_stream = await self.get_chat_completions(context)
 
         # Ensure stream and its async iterator are closed on cancellation/exception
         # to prevent socket leaks and uvloop crashes. Closing the iterator first
@@ -591,78 +584,134 @@ class BaseOpenAILLMService(LLMService[OpenAILLMAdapter]):
                 elif hasattr(stream, "aclose"):
                     await stream.aclose()
 
-        # Providers differ in how often they send usage: some once at the end,
-        # others a cumulative snapshot on every chunk. Holding the latest and
-        # reporting it after the stream keeps that to one report per completion.
-        token_usage: LLMTokenUsage | None = None
+        # Inshurik patch 7: a completion can connect (headers arrive, so
+        # retry_timeout_secs is satisfied) and then stall before its FIRST
+        # token (32.7 s on inshurik prod run 5046). When first_token_timeout_secs
+        # is set, tear such a stream down through _closing and retry ONCE
+        # without the bound. Restarting from scratch is safe: nothing is pushed
+        # downstream until a choices-bearing chunk arrives, so the accumulators
+        # reset cleanly per attempt.
+        max_attempts = 2 if self._first_token_timeout_secs else 1
 
-        try:
-            async with _closing(chunk_stream) as chunk_iter:
-                async for chunk in chunk_iter:
-                    if chunk.usage:
-                        token_usage = self._token_usage(chunk.usage)
+        for attempt in range(1, max_attempts + 1):
+            functions_list = []
+            arguments_list = []
+            tool_id_list = []
+            func_idx = 0
+            function_name = ""
+            arguments = ""
+            tool_call_id = ""
 
-                    if chunk.model and self.get_full_model_name() != chunk.model:
-                        self.set_full_model_name(chunk.model)
+            # Content generated in the current completion, accumulated so the
+            # deferral decision below can ask whether any of it is speakable.
+            generated_content = ""
 
-                    if chunk.choices is None or len(chunk.choices) == 0:
-                        continue
+            await self.start_ttfb_metrics()
 
-                    await self.stop_ttfb_metrics()
+            # Generate chat completions from LLMContext
+            chunk_stream = await self.get_chat_completions(context)
 
-                    if not chunk.choices[0].delta:
-                        continue
+            first_choices_seen = False
+            first_token_timed_out = False
 
-                    if chunk.choices[0].delta.tool_calls:
-                        # A turn that only calls tools produces no answer text, so
-                        # the call itself is what the caller gets and TTFAT ends
-                        # here rather than going unmeasured.
-                        await self.stop_ttfat_metrics()
+            # Providers differ in how often they send usage: some once at the end,
+            # others a cumulative snapshot on every chunk. Holding the latest and
+            # reporting it after the stream keeps that to one report per completion.
+            token_usage: LLMTokenUsage | None = None
 
-                        # We're streaming the LLM response to enable the fastest response times.
-                        # For text, we just yield each chunk as we receive it and count on consumers
-                        # to do whatever coalescing they need (eg. to pass full sentences to TTS)
-                        #
-                        # If the LLM is a function call, we'll do some coalescing here.
-                        # If the response contains a function name, we'll yield a frame to tell consumers
-                        # that they can start preparing to call the function with that name.
-                        # We accumulate all the arguments for the rest of the streamed response, then when
-                        # the response is done, we package up all the arguments and the function name and
-                        # yield a frame containing the function name and the arguments.
+            try:
+                async with _closing(chunk_stream) as chunk_iter:
+                    while True:
+                        try:
+                            if (
+                                not first_choices_seen
+                                and self._first_token_timeout_secs
+                                and attempt < max_attempts
+                            ):
+                                chunk = await asyncio.wait_for(
+                                    chunk_iter.__anext__(),
+                                    timeout=self._first_token_timeout_secs,
+                                )
+                            else:
+                                chunk = await chunk_iter.__anext__()
+                        except StopAsyncIteration:
+                            break
+                        except asyncio.TimeoutError:
+                            first_token_timed_out = True
+                            break
+                        if chunk.usage:
+                            token_usage = self._token_usage(chunk.usage)
 
-                        tool_call = chunk.choices[0].delta.tool_calls[0]
-                        if tool_call.index != func_idx:
-                            functions_list.append(function_name)
-                            arguments_list.append(arguments or "{}")
-                            tool_id_list.append(tool_call_id)
-                            function_name = ""
-                            arguments = ""
-                            tool_call_id = ""
-                            func_idx += 1
-                        if tool_call.function and tool_call.function.name:
-                            function_name += tool_call.function.name
-                            tool_call_id = tool_call.id
-                        if tool_call.function and tool_call.function.arguments:
-                            # Keep iterating through the response to collect all the argument fragments
-                            arguments += tool_call.function.arguments
-                    elif chunk.choices[0].delta.content:
-                        generated_content += chunk.choices[0].delta.content
-                        await self._push_llm_text(chunk.choices[0].delta.content)
+                        if chunk.model and self.get_full_model_name() != chunk.model:
+                            self.set_full_model_name(chunk.model)
 
-                    # When gpt-4o-audio / gpt-4o-mini-audio is used for llm or stt+llm
-                    # we need to get LLMTextFrame for the transcript
-                    elif (
-                        hasattr(chunk.choices[0].delta, "audio")
-                        and chunk.choices[0].delta.audio
-                        and chunk.choices[0].delta.audio.get("transcript")
-                    ):
-                        await self.push_frame(
-                            LLMTextFrame(chunk.choices[0].delta.audio["transcript"])
-                        )
-        finally:
-            # Report even if the response is interrupted or cancelled mid-stream.
-            if token_usage:
-                await self.start_llm_usage_metrics(token_usage)
+                        if chunk.choices is None or len(chunk.choices) == 0:
+                            continue
+
+                        await self.stop_ttfb_metrics()
+                        first_choices_seen = True
+
+                        if not chunk.choices[0].delta:
+                            continue
+
+                        if chunk.choices[0].delta.tool_calls:
+                            # A turn that only calls tools produces no answer text, so
+                            # the call itself is what the caller gets and TTFAT ends
+                            # here rather than going unmeasured.
+                            await self.stop_ttfat_metrics()
+
+                            # We're streaming the LLM response to enable the fastest response times.
+                            # For text, we just yield each chunk as we receive it and count on consumers
+                            # to do whatever coalescing they need (eg. to pass full sentences to TTS)
+                            #
+                            # If the LLM is a function call, we'll do some coalescing here.
+                            # If the response contains a function name, we'll yield a frame to tell consumers
+                            # that they can start preparing to call the function with that name.
+                            # We accumulate all the arguments for the rest of the streamed response, then when
+                            # the response is done, we package up all the arguments and the function name and
+                            # yield a frame containing the function name and the arguments.
+
+                            tool_call = chunk.choices[0].delta.tool_calls[0]
+                            if tool_call.index != func_idx:
+                                functions_list.append(function_name)
+                                arguments_list.append(arguments or "{}")
+                                tool_id_list.append(tool_call_id)
+                                function_name = ""
+                                arguments = ""
+                                tool_call_id = ""
+                                func_idx += 1
+                            if tool_call.function and tool_call.function.name:
+                                function_name += tool_call.function.name
+                                tool_call_id = tool_call.id
+                            if tool_call.function and tool_call.function.arguments:
+                                # Keep iterating through the response to collect all the argument fragments
+                                arguments += tool_call.function.arguments
+                        elif chunk.choices[0].delta.content:
+                            generated_content += chunk.choices[0].delta.content
+                            await self._push_llm_text(chunk.choices[0].delta.content)
+
+                        # When gpt-4o-audio / gpt-4o-mini-audio is used for llm or stt+llm
+                        # we need to get LLMTextFrame for the transcript
+                        elif (
+                            hasattr(chunk.choices[0].delta, "audio")
+                            and chunk.choices[0].delta.audio
+                            and chunk.choices[0].delta.audio.get("transcript")
+                        ):
+                            await self.push_frame(
+                                LLMTextFrame(chunk.choices[0].delta.audio["transcript"])
+                            )
+            finally:
+                # Report even if the response is interrupted or cancelled mid-stream.
+                if token_usage:
+                    await self.start_llm_usage_metrics(token_usage)
+
+            if first_token_timed_out:
+                logger.warning(
+                    f"{self}: no first token within {self._first_token_timeout_secs}s "
+                    f"(attempt {attempt}/{max_attempts}); stalled stream closed, retrying once"
+                )
+                continue
+            break
 
         # if we got a function name and arguments, check to see if it's a function with
         # a registered handler. If so, run the registered callback, save the result to
