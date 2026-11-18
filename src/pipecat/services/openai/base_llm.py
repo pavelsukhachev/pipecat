@@ -579,7 +579,9 @@ class BaseOpenAILLMService(LLMService[OpenAILLMAdapter]):
                             # input rate. Providers without prompt caching omit the
                             # field, which reads as "not reported" rather than zero.
                             cache_write_tokens = (
-                                getattr(chunk.usage.prompt_tokens_details, "cache_write_tokens", None)
+                                getattr(
+                                    chunk.usage.prompt_tokens_details, "cache_write_tokens", None
+                                )
                                 if chunk.usage.prompt_tokens_details
                                 else None
                             )
@@ -659,7 +661,6 @@ class BaseOpenAILLMService(LLMService[OpenAILLMAdapter]):
                 # Report even if the response is interrupted or cancelled mid-stream.
                 if token_usage:
                     await self.start_llm_usage_metrics(token_usage)
-
 
             if first_token_timed_out:
                 logger.warning(
